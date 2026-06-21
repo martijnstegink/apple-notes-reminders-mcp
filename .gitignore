@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+
+# Local Claude Code settings (machine-specific, contains local paths)
+.claude/settings.local.json
+
+# macOS
+.DS_Store
+__MACOSX/
+
+# Logs and temp
+*.log
+*.tmp
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Swift build artifacts
+swift/**/.build/
+*.o
