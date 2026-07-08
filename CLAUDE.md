@@ -14,13 +14,16 @@ npm run build:swift   # swiftc swift/reminders-daemon.swift -o swift/reminders-d
 npm start             # node dist/index.js (the MCP server, stdio transport)
 ```
 
-There is no lint script and no `npm test`. The only test suite is a standalone script:
+There is no lint script and no `npm test`. Test suites are standalone scripts:
 
 ```bash
-npm run build && node scripts/test-phase2.mjs
+npm run build && node scripts/test-phase2.mjs      # protobuf/checklist decoder
+npm run build && node scripts/test-markdown.mjs    # markdown -> Notes-HTML converter
 ```
 
 `scripts/test-phase2.mjs` is self-contained — it reimplements the protobuf varint/field decoder inline (mirroring `notesStore.ts`) rather than importing it, so unit-test sections (varint safety, checklist edge cases) run without touching the real Notes database. Its final section ("Real DB notes") does open the actual `dist/notesStore.js` and read specific note IDs (`p9875`, `p9656`, `p9858`) that only exist in the original author's own Notes.app — those cases will fail/error on any other machine and can be ignored when validating unrelated changes.
+
+`scripts/test-markdown.mjs` imports `dist/markdown.js` directly and asserts exact HTML output for the markdown converter — fully deterministic, no Notes.app or SQLite access needed.
 
 There is a manual/live-verification convention for AppleScript- and daemon-backed write paths (Notes create/update/delete/move, Reminders create/update/subtasks): exercise them only against a Notes folder and Reminders list both named `MCP-Test`, never against real data, and clean up test items afterward.
 
@@ -53,9 +56,15 @@ Shared `runAppleScript(script, args?, timeoutMs?)` helper used by both `notes.ts
 
 Note-identifier dispatch (`asFindClause` in `notes.ts`) decides "is this an ID vs. a title" by checking for the `x-coredata://` URI prefix specifically — not a generic `includes(":")` check, since note titles can legitimately contain colons.
 
+### src/markdown.ts
+
+Lightweight markdown → Notes-compatible HTML converter (not a full CommonMark implementation): `#`/`##`/`###` headings, `**bold**`/`*italic*`/`_italic_`, `-`/`*` and `1.` lists, `` `code` ``, `[text](url)`, blank lines, one `<div>` per plain-text line. Unrecognized constructs degrade rather than error — table rows and `- [ ]`/`- [x]` checklist syntax fall through as literal paragraph/dash-list text (real Apple checklist state can't be set via the AppleScript `body` property — see `notesStore.ts` — so there's no point pretending to support it), and `#hashtags` inside a paragraph are left as plain text since Notes auto-links them itself once it parses the saved body. `renderBody(body, format)` dispatches on `NoteBodyFormat` ("markdown" default | "html" passthrough | "text" literal-escaped).
+
 ### src/notes.ts
 
 Wraps `notesStore.ts` reads and adds AppleScript-based writes (create/update/delete/move/folder ops) via `src/applescript.ts`. Also contains an HTML→plain-text converter (`htmlToPlainText`) used only as a fallback: if `notes_get` gets an empty body from the SQLite decoder (unrecognized blob), it re-fetches via AppleScript's `body` property and converts that HTML — but that path loses checkbox state, since AppleScript's `body` doesn't encode it.
+
+`createNote`/`updateNote` render `body` through `src/markdown.ts`'s `renderBody()` per a `format` param (default `"markdown"`). Both auto-prepend `<h1>{title}</h1>` to the rendered body — Notes.app derives a note's displayed title from the first line of its body, so without this the AppleScript `name:` property and the body's own first line can disagree. `updateNote` also takes a `mode`: `"replace"` (default) rebuilds the body from scratch and is guarded — if the note currently has attachments, it refuses and returns `{ applied: false, warning }` unless `force: true`, since nothing here re-embeds the original attachment markup; `"append"`/`"prepend"` instead fetch the note's current raw HTML via AppleScript's `body` property (which *does* include attachment markup) and concatenate the newly rendered content onto it, so existing attachments survive.
 
 ### src/reminders.ts + swift/reminders-daemon.swift
 

@@ -1,5 +1,6 @@
 import * as Store from "./notesStore.js";
 import { runAppleScript } from "./applescript.js";
+import { escapeHtml, renderBody, type NoteBodyFormat } from "./markdown.js";
 
 export interface Note {
   id: string;
@@ -301,8 +302,17 @@ export async function queryNotesWhere(
 
 // ─── Write operations — AppleScript ──────────────────────────────────────────
 
-export async function createNote(name: string, body: string, folderName?: string): Promise<string> {
-  const args = [name, body];
+export async function createNote(
+  name: string,
+  body: string,
+  folderName?: string,
+  format: NoteBodyFormat = "markdown"
+): Promise<string> {
+  // Notes.app derives a new note's displayed title from the first line of its body
+  // at creation time — prepending the title as its own heading keeps it in sync
+  // with the `name` property regardless of what the body otherwise renders as.
+  const finalBody = `<h1>${escapeHtml(name)}</h1>` + renderBody(body, format);
+  const args = [name, finalBody];
   let folderClause = "";
   if (folderName) {
     args.push(folderName);
@@ -319,15 +329,85 @@ end run`,
   );
 }
 
-export async function updateNote(identifier: string, updates: { name?: string; body?: string; folderName?: string }): Promise<void> {
+async function noteAttachmentCount(identifier: string): Promise<number> {
+  const result = await runAppleScript(
+    `on run argv
+tell application "Notes"
+  set n to ${asFindClause(identifier, 1)}
+  return (count of attachments of n) as string
+end tell
+end run`,
+    [identifier]
+  );
+  return parseInt(result.trim() || "0", 10);
+}
+
+// Raw HTML as Notes.app itself renders it (including any attachment markup) — distinct
+// from Notes.get()'s decoded plain text, which discards formatting and attachments entirely.
+async function fetchRawBodyByIdentifier(identifier: string): Promise<string> {
+  return runAppleScript(
+    `on run argv
+tell application "Notes"
+  set n to ${asFindClause(identifier, 1)}
+  return body of n
+end tell
+end run`,
+    [identifier]
+  );
+}
+
+export interface UpdateNoteOptions {
+  name?: string;
+  body?: string;
+  folderName?: string;
+  format?: NoteBodyFormat;
+  mode?: "replace" | "append" | "prepend";
+  force?: boolean;
+}
+
+export type UpdateNoteResult = { applied: true } | { applied: false; warning: string };
+
+export async function updateNote(identifier: string, updates: UpdateNoteOptions): Promise<UpdateNoteResult> {
+  let finalBody: string | undefined;
+
+  if (updates.body !== undefined) {
+    const format = updates.format ?? "markdown";
+    const mode = updates.mode ?? "replace";
+    const newHtml = renderBody(updates.body, format);
+
+    if (mode === "replace") {
+      // A full body replace can't preserve attachments — we never re-embed the original
+      // attachment markup here — so require an explicit opt-in once any exist.
+      const attachmentCount = await noteAttachmentCount(identifier);
+      if (attachmentCount > 0 && !updates.force) {
+        return {
+          applied: false,
+          warning:
+            `This note has ${attachmentCount} attachment(s) that a full body replace would destroy. ` +
+            `Re-call with force=true to replace anyway, or use mode="append"/"prepend" to keep them.`,
+        };
+      }
+      const title = updates.name ?? (await getNote(identifier))?.name ?? "";
+      finalBody = `<h1>${escapeHtml(title)}</h1>` + newHtml;
+    } else {
+      // append/prepend keep the note's existing raw HTML (attachments included) and
+      // just add the newly rendered content alongside it.
+      const currentRawBody = await fetchRawBodyByIdentifier(identifier);
+      finalBody =
+        mode === "append"
+          ? currentRawBody + "<div><br></div>" + newHtml
+          : newHtml + "<div><br></div>" + currentRawBody;
+    }
+  }
+
   const args = [identifier];
   let script = `on run argv\ntell application "Notes"\n  set n to ${asFindClause(identifier, 1)}\n`;
   if (updates.name !== undefined) {
     args.push(updates.name);
     script += `  set name of n to (item ${args.length} of argv)\n`;
   }
-  if (updates.body !== undefined) {
-    args.push(updates.body);
+  if (finalBody !== undefined) {
+    args.push(finalBody);
     script += `  set body of n to (item ${args.length} of argv)\n`;
   }
   if (updates.folderName !== undefined) {
@@ -336,6 +416,7 @@ export async function updateNote(identifier: string, updates: { name?: string; b
   }
   script += `end tell\nend run`;
   await runAppleScript(script, args);
+  return { applied: true };
 }
 
 export async function deleteNote(identifier: string): Promise<void> {

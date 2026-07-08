@@ -84,30 +84,46 @@ server.tool(
   }
 );
 
+const noteBodyFormat = z.enum(["markdown", "html", "text"]).optional().describe(
+  "How to interpret body (default markdown): markdown supports # / ## / ### headings, " +
+  "**bold**, *italic*/_italic_, - or * lists, 1. lists, [text](url), and inline `code`; " +
+  "html is passed through as-is; text is treated as literal plain text."
+);
+
 server.tool(
   "notes_create",
   "Create a new note",
   {
     name: z.string().describe("Title"),
-    body: z.string().describe("Body content (HTML or plain text)"),
+    body: z.string().describe("Body content — interpreted per `format` (default markdown)"),
     folder: z.string().optional().describe("Folder name"),
+    format: noteBodyFormat,
   },
-  async ({ name, body, folder }) => ({
-    content: [{ type: "text", text: `Note created: ${await Notes.createNote(name, body, folder)}` }],
+  async ({ name, body, folder, format }) => ({
+    content: [{ type: "text", text: `Note created: ${await Notes.createNote(name, body, folder, format)}` }],
   })
 );
 
 server.tool(
   "notes_update",
-  "Update an existing note",
+  "Update an existing note. mode controls how a new body combines with the existing one: " +
+  "replace (default, full overwrite), append, or prepend. SAFETY: replacing the body of a note " +
+  "that has attachments requires force=true, since a full replace can't preserve them — use " +
+  "mode=\"append\"/\"prepend\" instead to keep them.",
   {
     identifier: z.string().describe("Note name or ID"),
     name: z.string().optional().describe("New title"),
-    body: z.string().optional().describe("New body content"),
+    body: z.string().optional().describe("New body content — interpreted per `format`"),
     folder: z.string().optional().describe("Move to folder"),
+    format: noteBodyFormat,
+    mode: z.enum(["replace", "append", "prepend"]).optional().describe("How a new body combines with the existing one (default replace)"),
+    force: z.boolean().optional().describe("Set true to replace the body of a note that has attachments"),
   },
-  async ({ identifier, name, body, folder }) => {
-    await Notes.updateNote(identifier, { name, body, folderName: folder });
+  async ({ identifier, name, body, folder, format, mode, force }) => {
+    const result = await Notes.updateNote(identifier, { name, body, folderName: folder, format, mode, force });
+    if (!result.applied) {
+      return { content: [{ type: "text", text: result.warning }], isError: true };
+    }
     return { content: [{ type: "text", text: "Note updated." }] };
   }
 );
