@@ -1,5 +1,6 @@
 import Foundation
 import EventKit
+import CoreLocation
 
 // MARK: - Globals
 
@@ -68,7 +69,19 @@ func reminderToDict(_ r: EKReminder) -> [String: Any] {
         "hasAlarms": !(r.alarms?.isEmpty ?? true),
         "dueDate": r.dueDateComponents?.date.map { iso.string(from: $0) } ?? "",
         "completionDate": r.completionDate.map { iso.string(from: $0) } ?? "",
+        "isRecurring": !(r.recurrenceRules?.isEmpty ?? true),
     ]
+    if let rule = r.recurrenceRules?.first {
+        let freqStr: String
+        switch rule.frequency {
+        case .daily: freqStr = "daily"
+        case .weekly: freqStr = "weekly"
+        case .monthly: freqStr = "monthly"
+        case .yearly: freqStr = "yearly"
+        @unknown default: freqStr = "unknown"
+        }
+        dict["recurrence"] = ["frequency": freqStr, "interval": rule.interval]
+    }
     return dict
 }
 
@@ -76,11 +89,68 @@ func listToDict(_ cal: EKCalendar) -> [String: Any] {
     ["id": cal.calendarIdentifier, "name": cal.title]
 }
 
+// JS's Date#toISOString() always emits fractional-second timestamps
+// ("2026-07-08T15:00:00.000Z"), which a plain ISO8601DateFormatter() fails to
+// parse (returns nil) since .withFractionalSeconds isn't in its default
+// formatOptions. Try fractional first, fall back to the no-fraction form.
+private let isoFractionalFormatter: ISO8601DateFormatter = {
+    let f = ISO8601DateFormatter()
+    f.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    return f
+}()
+private let isoPlainFormatter = ISO8601DateFormatter()
+
+func parseISODate(_ s: String) -> Date? {
+    isoFractionalFormatter.date(from: s) ?? isoPlainFormatter.date(from: s)
+}
+
 func parseDate(_ iso: String) -> DateComponents? {
-    if let d = ISO8601DateFormatter().date(from: iso) {
+    if let d = parseISODate(iso) {
         return Calendar.current.dateComponents([.year,.month,.day,.hour,.minute,.second], from: d)
     }
     return nil
+}
+
+/// Builds an EKRecurrenceRule from {frequency, interval?, count?, until?}.
+/// frequency is required: "daily" | "weekly" | "monthly" | "yearly".
+func buildRecurrenceRule(_ dict: [String: Any]) -> EKRecurrenceRule? {
+    guard let freqStr = dict["frequency"] as? String else { return nil }
+    let freq: EKRecurrenceFrequency
+    switch freqStr {
+    case "daily": freq = .daily
+    case "weekly": freq = .weekly
+    case "monthly": freq = .monthly
+    case "yearly": freq = .yearly
+    default: return nil
+    }
+    let interval = max(1, (dict["interval"] as? Int) ?? 1)
+    var end: EKRecurrenceEnd? = nil
+    if let countVal = dict["count"] as? Int {
+        end = EKRecurrenceEnd(occurrenceCount: countVal)
+    } else if let untilStr = dict["until"] as? String, let untilDate = parseISODate(untilStr) {
+        end = EKRecurrenceEnd(end: untilDate)
+    }
+    return EKRecurrenceRule(recurrenceWith: freq, interval: interval, end: end)
+}
+
+/// Adds one relative EKAlarm per entry in `minutes`, each firing that many minutes before `dueDate`.
+func addEarlyAlarms(_ r: EKReminder, dueDate: Date, minutes: [Int]) {
+    for m in minutes {
+        r.addAlarm(EKAlarm(absoluteDate: dueDate.addingTimeInterval(-Double(m) * 60)))
+    }
+}
+
+/// Adds a location-based EKAlarm from {latitude, longitude, radius?, proximity?, title?}.
+/// proximity: "arrive" (default) fires on entering the region, "leave" fires on exit.
+func addLocationAlarm(_ r: EKReminder, _ dict: [String: Any]) {
+    guard let lat = dict["latitude"] as? Double, let lon = dict["longitude"] as? Double else { return }
+    let structuredLoc = EKStructuredLocation(title: (dict["title"] as? String) ?? "Location")
+    structuredLoc.geoLocation = CLLocation(latitude: lat, longitude: lon)
+    structuredLoc.radius = (dict["radius"] as? Double) ?? 100
+    let alarm = EKAlarm()
+    alarm.structuredLocation = structuredLoc
+    alarm.proximity = ((dict["proximity"] as? String) == "leave") ? .leave : .enter
+    r.addAlarm(alarm)
 }
 
 // MARK: - Command handlers
@@ -143,7 +213,18 @@ func handleCreateReminder(id: String, params: [String: Any]) {
     if let urlStr = params["url"] as? String { r.url = URL(string: urlStr) }
     if let dueISO = params["dueDate"] as? String, let comps = parseDate(dueISO) {
         r.dueDateComponents = comps
-        r.addAlarm(EKAlarm(absoluteDate: Calendar.current.date(from: comps)!))
+        r.startDateComponents = comps
+        let dueDate = Calendar.current.date(from: comps)!
+        r.addAlarm(EKAlarm(absoluteDate: dueDate))
+        if let earlyMinutes = params["earlyAlarmMinutes"] as? [Int] {
+            addEarlyAlarms(r, dueDate: dueDate, minutes: earlyMinutes)
+        }
+        if let recurrenceDict = params["recurrence"] as? [String: Any], let rule = buildRecurrenceRule(recurrenceDict) {
+            r.recurrenceRules = [rule]
+        }
+    }
+    if let locDict = params["locationAlarm"] as? [String: Any] {
+        addLocationAlarm(r, locDict)
     }
     do {
         try store.save(r, commit: true)
@@ -163,14 +244,31 @@ func handleUpdateReminder(id: String, params: [String: Any]) {
     if let dueISO = params["dueDate"] as? String {
         if dueISO == "none" || dueISO == "remove" {
             r.dueDateComponents = nil
+            r.startDateComponents = nil
             r.alarms?.forEach { r.removeAlarm($0) }
+            r.recurrenceRules?.forEach { r.removeRecurrenceRule($0) }
         } else if let comps = parseDate(dueISO) {
             r.dueDateComponents = comps
+            r.startDateComponents = comps
         }
     }
     if let listName = params["listName"] as? String {
         guard let cal = findList(named: listName) else { respondError(id: id, message: "List not found: \(listName)"); return }
         r.calendar = cal
+    }
+    if let earlyMinutes = params["earlyAlarmMinutes"] as? [Int], let dueDate = r.dueDateComponents?.date {
+        addEarlyAlarms(r, dueDate: dueDate, minutes: earlyMinutes)
+    }
+    if let locDict = params["locationAlarm"] as? [String: Any] {
+        addLocationAlarm(r, locDict)
+    }
+    if let recurrenceParam = params["recurrence"] {
+        if let recurrenceDict = recurrenceParam as? [String: Any], let rule = buildRecurrenceRule(recurrenceDict) {
+            r.recurrenceRules?.forEach { r.removeRecurrenceRule($0) }
+            r.recurrenceRules = [rule]
+        } else if let s = recurrenceParam as? String, s == "none" || s == "remove" {
+            r.recurrenceRules?.forEach { r.removeRecurrenceRule($0) }
+        }
     }
     do {
         try store.save(r, commit: true)
@@ -217,6 +315,19 @@ func handleCreateList(id: String, params: [String: Any]) {
         respond(id: id, result: ["id": cal.calendarIdentifier, "name": cal.title])
     } catch {
         respondError(id: id, message: "List creation failed: \(error.localizedDescription)")
+    }
+}
+
+func handleRenameList(id: String, params: [String: Any]) {
+    guard let name = params["name"] as? String else { respondError(id: id, message: "name required"); return }
+    guard let newName = params["newName"] as? String else { respondError(id: id, message: "newName required"); return }
+    guard let cal = findList(named: name) else { respondError(id: id, message: "List not found: \(name)"); return }
+    cal.title = newName
+    do {
+        try store.saveCalendar(cal, commit: true)
+        respond(id: id, result: ["id": cal.calendarIdentifier, "name": cal.title])
+    } catch {
+        respondError(id: id, message: "Rename failed: \(error.localizedDescription)")
     }
 }
 
@@ -278,6 +389,61 @@ func handleDeleteCompleted(id: String, params: [String: Any]) {
     respond(id: id, result: ["deleted": deleted, "failed": failed, "total": toDelete.count])
 }
 
+/// Creates many reminders in one commit — avoids one save+commit round trip per item.
+/// params: {listName?, items: [{name, body?, priority?, url?, dueDate?}]}.
+/// Returns {"created": N, "failed": M, "errors": [{"index": i, "name": s, "error": s}]}.
+func handleCreateBatch(id: String, params: [String: Any]) {
+    guard let items = params["items"] as? [[String: Any]] else { respondError(id: id, message: "items required"); return }
+    var defaultCal: EKCalendar? = nil
+    if let listName = params["listName"] as? String {
+        guard let cal = findList(named: listName) else { respondError(id: id, message: "List not found: \(listName)"); return }
+        defaultCal = cal
+    }
+
+    var created = 0
+    var failed = 0
+    var errors: [[String: Any]] = []
+
+    for (i, item) in items.enumerated() {
+        guard let name = item["name"] as? String else {
+            failed += 1
+            errors.append(["index": i, "name": "", "error": "name required"])
+            continue
+        }
+        let r = EKReminder(eventStore: store)
+        r.title = name
+        r.calendar = defaultCal ?? store.defaultCalendarForNewReminders()
+        if let body = item["body"] as? String { r.notes = body }
+        if let priority = item["priority"] as? Int { r.priority = priority }
+        if let urlStr = item["url"] as? String { r.url = URL(string: urlStr) }
+        if let dueISO = item["dueDate"] as? String, let comps = parseDate(dueISO) {
+            r.dueDateComponents = comps
+            r.startDateComponents = comps
+            r.addAlarm(EKAlarm(absoluteDate: Calendar.current.date(from: comps)!))
+        }
+        do {
+            try store.save(r, commit: false)
+            created += 1
+        } catch {
+            failed += 1
+            errors.append(["index": i, "name": name, "error": error.localizedDescription])
+        }
+    }
+
+    if created > 0 {
+        do {
+            try store.commit()
+        } catch {
+            // Commit failed — all staged creations are lost
+            errors.append(["index": -1, "name": "", "error": "Commit failed: \(error.localizedDescription)"])
+            failed += created
+            created = 0
+        }
+    }
+
+    respond(id: id, result: ["created": created, "failed": failed, "errors": errors])
+}
+
 // MARK: - Filter-based bulk operations
 
 /// Shared filter spec. All fields optional; a reminder must satisfy every
@@ -294,10 +460,11 @@ func matchingReminders(params: [String: Any]) -> (matches: [EKReminder]?, error:
     let search = (params["search"] as? String)?.lowercased()
     let completed = params["completed"] as? Bool
     let priority = params["priority"] as? Int
+    let priorityAtMost = params["priorityAtMost"] as? Int
+    let priorityAtLeast = params["priorityAtLeast"] as? Int
     let hasDueDate = params["hasDueDate"] as? Bool
-    let iso = ISO8601DateFormatter()
-    let dueBefore = (params["dueBefore"] as? String).flatMap { iso.date(from: $0) }
-    let dueAfter = (params["dueAfter"] as? String).flatMap { iso.date(from: $0) }
+    let dueBefore = (params["dueBefore"] as? String).flatMap { parseISODate($0) }
+    let dueAfter = (params["dueAfter"] as? String).flatMap { parseISODate($0) }
 
     let pred = store.predicateForReminders(in: cals)
     var result: [EKReminder] = []
@@ -306,6 +473,9 @@ func matchingReminders(params: [String: Any]) -> (matches: [EKReminder]?, error:
         result = (reminders ?? []).filter { r in
             if let c = completed, r.isCompleted != c { return false }
             if let p = priority, r.priority != p { return false }
+            // EventKit priority 0 means "none" — exclude it from at-least/at-most range checks
+            if let pMax = priorityAtMost, !(r.priority > 0 && r.priority <= pMax) { return false }
+            if let pMin = priorityAtLeast, !(r.priority > 0 && r.priority >= pMin) { return false }
             if let h = hasDueDate, (r.dueDateComponents?.date != nil) != h { return false }
             if let s = search, !s.isEmpty {
                 let inTitle = r.title?.lowercased().contains(s) ?? false
@@ -409,8 +579,10 @@ func handleCommand(id: String, command: String, params: [String: Any]) {
     case "complete-reminder":    handleCompleteReminder(id: id, params: params)
     case "delete-reminder":      handleDeleteReminder(id: id, params: params)
     case "create-list":          handleCreateList(id: id, params: params)
+    case "rename-list":          handleRenameList(id: id, params: params)
     case "delete-list":          handleDeleteList(id: id, params: params)
     case "delete-completed":     handleDeleteCompleted(id: id, params: params)
+    case "create-batch":         handleCreateBatch(id: id, params: params)
     case "query-where":          handleQueryWhere(id: id, params: params)
     case "delete-where":         handleDeleteWhere(id: id, params: params)
     case "complete-where":       handleCompleteWhere(id: id, params: params)

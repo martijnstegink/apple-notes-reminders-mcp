@@ -198,6 +198,35 @@ server.tool(
   }
 );
 
+const recurrenceShape = z.object({
+  frequency: z.enum(["daily", "weekly", "monthly", "yearly"]).describe("How often it repeats"),
+  interval: z.number().int().positive().optional().describe("Repeat every N units (default 1)"),
+  count: z.number().int().positive().optional().describe("Stop after this many occurrences"),
+  until: z.string().optional().describe("Stop repeating after this ISO date"),
+}).describe("Recurrence rule, e.g. { frequency: \"weekly\", interval: 2 } for every 2 weeks");
+
+const locationAlarmShape = z.object({
+  latitude: z.number().describe("Latitude of the alert location"),
+  longitude: z.number().describe("Longitude of the alert location"),
+  radius: z.number().positive().optional().describe("Trigger radius in meters (default 100)"),
+  proximity: z.enum(["arrive", "leave"]).optional().describe("Alert on arrival (default) or on leaving"),
+  title: z.string().optional().describe("Label for the location"),
+}).describe("Location-based alert, in addition to (or instead of) a due-date alert");
+
+server.tool(
+  "reminders_view",
+  "Fetch a Reminders.app-style smart list: today (due today), planned (due after today), " +
+  "overdue (due before today, incomplete), urgent (priority 1-4, incomplete), flagged, or completed.",
+  {
+    view: z.enum(["today", "planned", "overdue", "urgent", "flagged", "completed"]).describe("Which smart list to fetch"),
+    list: z.string().optional().describe("Restrict to this list (omit for all lists)"),
+  },
+  async ({ view, list }) => {
+    const r = await Reminders.viewReminders(view, list);
+    return { content: [{ type: "text", text: r.length ? JSON.stringify(r, null, 2) : "No reminders found." }] };
+  }
+);
+
 server.tool(
   "reminders_create",
   "Create a reminder. Due dates accept natural language: 'tomorrow at 10am', 'next Friday', 'December 25 9:00'",
@@ -208,9 +237,18 @@ server.tool(
     due_date: z.string().optional().describe("Due date in natural language"),
     priority: z.number().min(0).max(9).optional().describe("Priority: 0=none, 1=high, 5=medium, 9=low"),
     url: z.string().optional().describe("URL to attach"),
+    flagged: z.boolean().optional().describe("Mark as flagged"),
+    recurrence: recurrenceShape.optional(),
+    early_reminders: z.array(z.number().int().positive()).optional().describe(
+      "Minutes before the due date to also alert, in addition to the due-date alert itself. Requires due_date."
+    ),
+    location_alarm: locationAlarmShape.optional(),
   },
-  async ({ name, body, list, due_date, priority, url }) => {
-    const id = await Reminders.createReminder({ name, body, listName: list, dueDateInput: due_date, priority, url });
+  async ({ name, body, list, due_date, priority, url, flagged, recurrence, early_reminders, location_alarm }) => {
+    const id = await Reminders.createReminder({
+      name, body, listName: list, dueDateInput: due_date, priority, url, flagged,
+      recurrence, earlyAlarmMinutes: early_reminders, locationAlarm: location_alarm,
+    });
     let dateMsg = "";
     if (due_date) {
       const d = Reminders.parseNaturalDate(due_date);
@@ -222,7 +260,7 @@ server.tool(
 
 server.tool(
   "reminders_create_batch",
-  "Create multiple reminders in one call. All items land in the same list. Due dates accept natural language ('tomorrow at 10am', 'next Friday'). Returns a short summary — no individual IDs.",
+  "Create multiple reminders in one call (single database commit — fast even for large batches). All items land in the same list. Due dates accept natural language ('tomorrow at 10am', 'next Friday'). Returns a short summary — no individual IDs.",
   {
     list: z.string().describe("List to add all reminders to"),
     items: z.array(z.object({
@@ -234,9 +272,7 @@ server.tool(
     })).min(1).describe("Reminders to create"),
   },
   async ({ list, items }) => {
-    const result = await Reminders.createRemindersBatch(
-      items.map((item) => ({ name: item.name, body: item.body, listName: list, dueDateInput: item.due_date, priority: item.priority, url: item.url }))
-    );
+    const result = await Reminders.createRemindersBatch(items, list);
     const lines = [`Created ${result.created}/${items.length} reminder(s) in "${list}".`];
     if (result.errors.length > 0) {
       lines.push(`Failed: ${result.failed}`);
@@ -257,9 +293,18 @@ server.tool(
     priority: z.number().min(0).max(9).optional().describe("New priority"),
     url: z.string().optional().describe("New URL"),
     list: z.string().optional().describe("Move to list"),
+    flagged: z.boolean().optional().describe("Set flagged state"),
+    recurrence: z.union([recurrenceShape, z.literal("none")]).optional().describe("New recurrence rule, or \"none\" to stop repeating"),
+    early_reminders: z.array(z.number().int().positive()).optional().describe(
+      "Minutes before the due date to add an alert (additive — existing alerts are kept)"
+    ),
+    location_alarm: locationAlarmShape.optional().describe("Adds a location-based alert (additive — existing alerts are kept)"),
   },
-  async ({ identifier, name, body, due_date, priority, url, list }) => {
-    await Reminders.updateReminder(identifier, { name, body, dueDateInput: due_date, priority, url, listName: list });
+  async ({ identifier, name, body, due_date, priority, url, list, flagged, recurrence, early_reminders, location_alarm }) => {
+    await Reminders.updateReminder(identifier, {
+      name, body, dueDateInput: due_date, priority, url, listName: list, flagged,
+      recurrence, earlyAlarmMinutes: early_reminders, locationAlarm: location_alarm,
+    });
     return { content: [{ type: "text", text: "Reminder updated." }] };
   }
 );
@@ -294,6 +339,16 @@ server.tool(
   async ({ name }) => ({
     content: [{ type: "text", text: `List created: ${await Reminders.createReminderList(name)}` }],
   })
+);
+
+server.tool(
+  "reminders_rename_list",
+  "Rename a reminder list",
+  { name: z.string().describe("Current list name"), new_name: z.string().describe("New list name") },
+  async ({ name, new_name }) => {
+    await Reminders.renameReminderList(name, new_name);
+    return { content: [{ type: "text", text: `List renamed to "${new_name}".` }] };
+  }
 );
 
 server.tool(
@@ -356,15 +411,24 @@ const reminderFilterShape = {
   due_before: z.string().optional().describe("Match reminders due before this date (natural language, e.g. 'today', 'next Monday')"),
   due_after: z.string().optional().describe("Match reminders due after this date (natural language)"),
   priority: z.number().min(0).max(9).optional().describe("Match exact priority (0=none,1=high,5=medium,9=low)"),
+  priority_at_most: z.number().min(1).max(9).optional().describe("Match priority <= this (excludes 0/none)"),
+  priority_at_least: z.number().min(1).max(9).optional().describe("Match priority >= this (excludes 0/none)"),
   has_due_date: z.boolean().optional().describe("Match only reminders that have (true) or lack (false) a due date"),
+  flagged: z.boolean().optional().describe(
+    "Match flagged (true) or unflagged (false) only. EventKit has no native flagged concept, so this " +
+    "resolves via a per-list (or, if no list given, whole-library) AppleScript scan and is slower than other filters."
+  ),
 };
 
 const toReminderFilter = (a: {
   list?: string; completed?: boolean; search?: string;
-  due_before?: string; due_after?: string; priority?: number; has_due_date?: boolean;
+  due_before?: string; due_after?: string; priority?: number;
+  priority_at_most?: number; priority_at_least?: number; has_due_date?: boolean; flagged?: boolean;
 }): Reminders.ReminderFilter => ({
   list: a.list, completed: a.completed, search: a.search,
-  dueBefore: a.due_before, dueAfter: a.due_after, priority: a.priority, hasDueDate: a.has_due_date,
+  dueBefore: a.due_before, dueAfter: a.due_after, priority: a.priority,
+  priorityAtMost: a.priority_at_most, priorityAtLeast: a.priority_at_least,
+  hasDueDate: a.has_due_date, flagged: a.flagged,
 });
 
 server.tool(
