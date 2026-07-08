@@ -239,13 +239,24 @@ export async function getFolderWithBodies(
 }
 
 export async function searchNotes(
-  query: string
-): Promise<{ results: NoteRowOut[]; skipped: number }> {
+  query: string,
+  withBody = false,
+  maxChars?: number
+): Promise<{ results: (NoteRowOut | (NoteRowOut & { body: string; truncated: boolean }))[]; skipped: number }> {
   const q = query.toLowerCase();
-  const all = Store.readAllNotesWithBody();
-  const results = all
-    .filter((n) => `${n.name} ${n.body}`.toLowerCase().includes(q))
-    .map(({ body: _body, ...row }) => row);
+  const all = Store.readAllNotesWithBody(); // one DB open for the whole search
+  const filtered = all.filter((n) => `${n.name} ${n.body}`.toLowerCase().includes(q));
+  if (withBody) {
+    const limit = maxChars ?? 300;
+    const results = filtered.map(({ body, ...row }) => {
+      let b = body;
+      let truncated = false;
+      if (b.length > limit) { b = b.slice(0, limit); truncated = true; }
+      return { ...row, body: b, truncated };
+    });
+    return { results, skipped: 0 };
+  }
+  const results = filtered.map(({ body: _body, ...row }) => row);
   return { results, skipped: 0 };
 }
 

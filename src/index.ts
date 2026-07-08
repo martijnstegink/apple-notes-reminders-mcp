@@ -61,10 +61,25 @@ server.tool(
 
 server.tool(
   "notes_search",
-  "Search notes by title or content",
-  { query: z.string().describe("Search query") },
-  async ({ query }) => {
-    const { results, skipped } = await Notes.searchNotes(query);
+  "Search notes by title or content across all folders. " +
+  "Use with_body: true to include the decoded body of each matching note " +
+  "(checklist items render as - [x] / - [ ], same encoding as notes_get). " +
+  "Prefer notes_get_folder when the folder is known and you want all its notes; " +
+  "use notes_search for cross-folder queries or when the folder is unknown. " +
+  "Optional max_chars truncates large bodies (default 300 when with_body=true); " +
+  "truncated notes carry truncated=true so you can fetch the full body with notes_get.",
+  {
+    query: z.string().describe("Search query"),
+    with_body: z.boolean().optional().describe(
+      "Include the decoded body in each result (default false). Truncated to max_chars."
+    ),
+    max_chars: z.number().int().positive().optional().describe(
+      "Max body characters per result when with_body=true (default 300). " +
+      "Bodies longer than this are truncated and marked truncated=true."
+    ),
+  },
+  async ({ query, with_body, max_chars }) => {
+    const { results, skipped } = await Notes.searchNotes(query, with_body ?? false, max_chars);
     const text = results.length ? JSON.stringify(results, null, 2) : "No results.";
     const warn = skipped > 0 ? `\n[${skipped} note(s) skipped — could not read their properties]` : "";
     return { content: [{ type: "text", text: text + warn }] };

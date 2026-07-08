@@ -17,5 +17,8 @@
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^22.0.0",
     "typescript": "^5.7.0"
+  },
+  "allowScripts": {
+    "better-sqlite3@12.11.1": true
   }
 }
