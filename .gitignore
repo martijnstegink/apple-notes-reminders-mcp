@@ -23,3 +23,4 @@ __MACOSX/
 # Swift build artifacts
 swift/**/.build/
 *.o
+swift/reminders-daemon

@@ -18,10 +18,9 @@ server.tool(
   "List notes, optionally filtered by folder",
   { folder: z.string().optional().describe("Folder name to filter by") },
   async ({ folder }) => {
-    const { results, skipped } = await Notes.listNotes(folder);
+    const { results } = await Notes.listNotes(folder);
     const text = results.length ? JSON.stringify(results, null, 2) : "No notes found.";
-    const warn = skipped > 0 ? `\n[${skipped} note(s) skipped — could not read their properties]` : "";
-    return { content: [{ type: "text", text: text + warn }] };
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -79,10 +78,9 @@ server.tool(
     ),
   },
   async ({ query, with_body, max_chars }) => {
-    const { results, skipped } = await Notes.searchNotes(query, with_body ?? false, max_chars);
+    const { results } = await Notes.searchNotes(query, with_body ?? false, max_chars);
     const text = results.length ? JSON.stringify(results, null, 2) : "No results.";
-    const warn = skipped > 0 ? `\n[${skipped} note(s) skipped — could not read their properties]` : "";
-    return { content: [{ type: "text", text: text + warn }] };
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -428,12 +426,10 @@ server.tool(
   async ({ folder, search, count_only }) => {
     const result = await Notes.queryNotesWhere({ folder, search }, count_only ?? false);
     if ("count" in result) {
-      const warn = result.skipped > 0 ? `\n[${result.skipped} note(s) skipped — could not read their properties]` : "";
-      return { content: [{ type: "text", text: JSON.stringify({ count: result.count }, null, 2) + warn }] };
+      return { content: [{ type: "text", text: JSON.stringify({ count: result.count }, null, 2) }] };
     }
     const text = result.results.length ? JSON.stringify(result.results, null, 2) : "No notes match.";
-    const warn = result.skipped > 0 ? `\n[${result.skipped} note(s) skipped — could not read their properties]` : "";
-    return { content: [{ type: "text", text: text + warn }] };
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -443,11 +439,10 @@ server.tool(
   { ...noteFilterShape, confirm: z.boolean().optional().describe("Set true to actually delete; otherwise returns the count only") },
   async ({ folder, search, confirm }) => {
     const r = await Notes.deleteNotesWhere({ folder, search }, confirm ?? false);
-    const warn = r.skipped > 0 ? ` [${r.skipped} note(s) skipped — could not read their properties]` : "";
     if (!r.confirmed) {
-      return { content: [{ type: "text", text: `${r.count} note(s) match. Re-call with confirm=true to delete them.${warn}` }] };
+      return { content: [{ type: "text", text: `${r.count} note(s) match. Re-call with confirm=true to delete them.` }] };
     }
-    return { content: [{ type: "text", text: `Deleted ${r.deleted} matching note(s).${warn}` }] };
+    return { content: [{ type: "text", text: `Deleted ${r.deleted} matching note(s).` }] };
   }
 );
 
@@ -461,11 +456,10 @@ server.tool(
   },
   async ({ folder, search, destination_folder, confirm }) => {
     const r = await Notes.moveNotesWhere({ folder, search }, destination_folder, confirm ?? false);
-    const warn = r.skipped > 0 ? ` [${r.skipped} note(s) skipped — could not read their properties]` : "";
     if (!r.confirmed) {
-      return { content: [{ type: "text", text: `${r.count} note(s) match. Re-call with confirm=true to move them to "${destination_folder}".${warn}` }] };
+      return { content: [{ type: "text", text: `${r.count} note(s) match. Re-call with confirm=true to move them to "${destination_folder}".` }] };
     }
-    return { content: [{ type: "text", text: `Moved ${r.moved} note(s) to "${destination_folder}".${warn}` }] };
+    return { content: [{ type: "text", text: `Moved ${r.moved} note(s) to "${destination_folder}".` }] };
   }
 );
 

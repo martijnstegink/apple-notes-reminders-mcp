@@ -13,18 +13,27 @@ const DAEMON_BIN = path.join(__dirname, "..", "swift", "reminders-daemon");
 type PendingCall = {
   resolve: (result: unknown) => void;
   reject: (err: Error) => void;
+  timeout: NodeJS.Timeout;
 };
+
+const CALL_TIMEOUT_MS = 30_000;
+const BASE_RESTART_BACKOFF_MS = 500;
+const MAX_RESTART_BACKOFF_MS = 10_000;
 
 let daemon: ChildProcess | null = null;
 let daemonReadyPromise: Promise<void> | null = null;
 let daemonReadyResolve: (() => void) | null = null;
+let daemonReadyReject: ((err: Error) => void) | null = null;
+let spawnScheduled = false;
+let consecutiveFailedSpawns = 0;
+let nextSpawnAllowedAt = 0;
 const pending = new Map<string, PendingCall>();
 let buf = "";
 
-function ensureDaemon(): Promise<void> {
-  if (daemon && !daemon.killed && daemonReadyPromise) return daemonReadyPromise;
+function spawnDaemon(): void {
+  spawnScheduled = false;
+  let sawReady = false;
 
-  daemonReadyPromise = new Promise<void>((res) => { daemonReadyResolve = res; });
   daemon = spawn(DAEMON_BIN, [], { stdio: ["pipe", "pipe", "inherit"] });
 
   daemon.stdout!.on("data", (chunk: Buffer) => {
@@ -39,21 +48,24 @@ function ensureDaemon(): Promise<void> {
 
       // Startup signal
       if (msg.ready === true) {
+        sawReady = true;
+        consecutiveFailedSpawns = 0;
         daemonReadyResolve?.();
         continue;
       }
 
       const id = msg.id as string | undefined;
       if (!id) continue;
-      const call = pending.get(id);
-      if (!call) continue;
+      const pendingCall = pending.get(id);
+      if (!pendingCall) continue;
 
       // Single request/response per call
       pending.delete(id);
+      clearTimeout(pendingCall.timeout);
       if ("error" in msg) {
-        call.reject(new Error(String(msg.error)));
+        pendingCall.reject(new Error(String(msg.error)));
       } else {
-        call.resolve(msg.result);
+        pendingCall.resolve(msg.result);
       }
     }
   });
@@ -61,12 +73,35 @@ function ensureDaemon(): Promise<void> {
   daemon.on("exit", () => {
     daemon = null;
     daemonReadyPromise = null;
+    if (!sawReady) {
+      consecutiveFailedSpawns++;
+      nextSpawnAllowedAt =
+        Date.now() + Math.min(BASE_RESTART_BACKOFF_MS * 2 ** (consecutiveFailedSpawns - 1), MAX_RESTART_BACKOFF_MS);
+    }
+    const err = new Error("Daemon exited");
+    daemonReadyReject?.(err);
     // Reject all pending calls
-    for (const [id, call] of pending) {
-      call.reject(new Error("Daemon exited"));
+    for (const [id, pendingCall] of pending) {
+      clearTimeout(pendingCall.timeout);
+      pendingCall.reject(err);
       pending.delete(id);
     }
   });
+}
+
+function ensureDaemon(): Promise<void> {
+  if (daemon && !daemon.killed && daemonReadyPromise) return daemonReadyPromise;
+  if (spawnScheduled && daemonReadyPromise) return daemonReadyPromise;
+
+  daemonReadyPromise = new Promise<void>((res, rej) => {
+    daemonReadyResolve = res;
+    daemonReadyReject = rej;
+  });
+
+  const wait = Math.max(0, nextSpawnAllowedAt - Date.now());
+  spawnScheduled = true;
+  if (wait > 0) setTimeout(spawnDaemon, wait);
+  else spawnDaemon();
 
   return daemonReadyPromise;
 }
@@ -75,7 +110,11 @@ async function call(command: string, params?: Record<string, unknown>): Promise<
   await ensureDaemon();
   return new Promise((resolve, reject) => {
     const id = randomUUID();
-    pending.set(id, { resolve, reject });
+    const timeout = setTimeout(() => {
+      pending.delete(id);
+      reject(new Error(`Reminders daemon call "${command}" timed out after ${CALL_TIMEOUT_MS}ms`));
+    }, CALL_TIMEOUT_MS);
+    pending.set(id, { resolve, reject, timeout });
     const msg = JSON.stringify({ id, command, params: params ?? {} }) + "\n";
     daemon!.stdin!.write(msg);
   });
@@ -290,44 +329,60 @@ export async function moveRemindersWhere(
 
 // ─── Subtasks (AppleScript — EventKit public API does not expose subtasks) ────
 
-import { execFileSync } from "child_process";
+import { runAppleScript } from "./applescript.js";
 
-function runAS(script: string): string {
-  return execFileSync("osascript", ["-e", script], { encoding: "utf8", maxBuffer: 10 * 1024 * 1024 }).trim();
-}
-
-function findScript(id: string): string {
-  const e = id.replace(/"/g, '\\"');
+// Finds the parent reminder by id or name, read from argv[argIndex]; never
+// splice the identifier into the script text.
+// EventKit's calendarItemIdentifier (the id used everywhere else in this codebase)
+// is a bare UUID, but AppleScript's own `id of r` returns "x-apple-reminder://<uuid>" —
+// so match both the bare and prefixed forms, not just an exact string compare.
+function findScriptExpr(argIndex: number): string {
   return `set t to missing value
 repeat with l in lists
   repeat with r in reminders of l
-    if id of r is "${e}" or name of r is "${e}" then
+    if id of r is (item ${argIndex} of argv) or id of r is ("x-apple-reminder://" & (item ${argIndex} of argv)) or name of r is (item ${argIndex} of argv) then
       set t to r
       exit repeat
     end if
   end repeat
   if t is not missing value then exit repeat
 end repeat
-if t is missing value then error "Not found: ${e}"`;
+if t is missing value then error "Not found: " & (item ${argIndex} of argv)`;
 }
 
+// findScriptExpr brute-force scans every reminder in every list via AppleScript,
+// which measured ~20s on a real library — comfortably past the 30s default, so
+// these two calls get a longer timeout.
+const SUBTASK_TIMEOUT_MS = 90_000;
+
 export async function addSubtask(parentId: string, subtaskName: string): Promise<string> {
-  return runAS(`tell application "Reminders"
-${findScript(parentId)}
-set s to make new subtask at t with properties {name:"${subtaskName.replace(/"/g, '\\"')}"}
+  return runAppleScript(
+    `on run argv
+tell application "Reminders"
+${findScriptExpr(1)}
+set s to make new subtask at t with properties {name:(item 2 of argv)}
 return id of s
-end tell`);
+end tell
+end run`,
+    [parentId, subtaskName],
+    SUBTASK_TIMEOUT_MS
+  );
 }
 
 export async function completeSubtask(parentId: string, subtaskId: string, completed: boolean): Promise<void> {
-  const e = subtaskId.replace(/"/g, '\\"');
-  runAS(`tell application "Reminders"
-${findScript(parentId)}
+  await runAppleScript(
+    `on run argv
+tell application "Reminders"
+${findScriptExpr(1)}
 repeat with s in subtasks of t
-  if id of s is "${e}" or name of s is "${e}" then
-    set completed of s to ${completed}
+  if id of s is (item 2 of argv) or name of s is (item 2 of argv) then
+    set completed of s to ((item 3 of argv) is "true")
     exit repeat
   end if
 end repeat
-end tell`);
+end tell
+end run`,
+    [parentId, subtaskId, String(completed)],
+    SUBTASK_TIMEOUT_MS
+  );
 }

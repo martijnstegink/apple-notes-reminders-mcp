@@ -1,5 +1,5 @@
-import { execFileSync } from "child_process";
 import * as Store from "./notesStore.js";
+import { runAppleScript } from "./applescript.js";
 
 export interface Note {
   id: string;
@@ -19,17 +19,17 @@ export interface NoteFolder {
 
 // ─── AppleScript write helpers ────────────────────────────────────────────────
 
-function runAS(script: string): string {
-  return execFileSync("osascript", ["-e", script], {
-    encoding: "utf8",
-    maxBuffer: 256 * 1024 * 1024,
-  }).trim();
+function isNoteId(identifier: string): boolean {
+  return identifier.startsWith("x-coredata://");
 }
 
-// Resolve a note identifier (name or x-coredata:// URI) to AppleScript selector
-function asFind(identifier: string): string {
-  const esc = (s: string) => s.replace(/"/g, '\\"');
-  return identifier.includes(":") ? `note id "${esc(identifier)}"` : `first note whose name is "${esc(identifier)}"`;
+// Resolve a note identifier (name or x-coredata:// URI) to an AppleScript
+// selector expression that reads the identifier from argv[argIndex] — the
+// identifier itself is never spliced into the script text.
+function asFindClause(identifier: string, argIndex: number): string {
+  return isNoteId(identifier)
+    ? `note id (item ${argIndex} of argv)`
+    : `first note whose name is (item ${argIndex} of argv)`;
 }
 
 // ─── HTML → plain text (AppleScript body fallback) ───────────────────────────
@@ -133,14 +133,16 @@ function htmlToPlainText(html: string): string {
   return parts.join("").replace(/\n{3,}/g, "\n\n").trim();
 }
 
-function fetchBodyViaAppleScript(noteId: string): string | null {
+async function fetchBodyViaAppleScript(noteId: string): Promise<string | null> {
   try {
-    const esc = (s: string) => s.replace(/"/g, '\\"');
-    return execFileSync(
-      "osascript",
-      ["-e", `tell application "Notes" to return body of note id "${esc(noteId)}"`],
-      { encoding: "utf8", timeout: 10_000, maxBuffer: 64 * 1024 * 1024 }
-    ).trim() || null;
+    const result = await runAppleScript(
+      `on run argv
+tell application "Notes" to return body of note id (item 1 of argv)
+end run`,
+      [noteId],
+      10_000
+    );
+    return result || null;
   } catch {
     return null;
   }
@@ -154,12 +156,10 @@ export async function listFolders(): Promise<NoteFolder[]> {
 
 type NoteRowOut = Omit<Note, "body" | "attachments">;
 
-export async function listNotes(
-  folderName?: string
-): Promise<{ results: NoteRowOut[]; skipped: number }> {
+export async function listNotes(folderName?: string): Promise<{ results: NoteRowOut[] }> {
   const all = Store.readAllNotes(false);
   const filtered = folderName ? all.filter((n) => n.folder === folderName) : all;
-  return { results: filtered, skipped: 0 };
+  return { results: filtered };
 }
 
 export async function getNote(identifier: string): Promise<Note | null> {
@@ -179,7 +179,7 @@ export async function getNote(identifier: string): Promise<Note | null> {
     // Empty body means the blob was unrecognized — try AppleScript as fallback.
     let body = found.body;
     if (!body) {
-      const html = fetchBodyViaAppleScript(found.id);
+      const html = await fetchBodyViaAppleScript(found.id);
       if (html) body = htmlToPlainText(html);
     }
     return {
@@ -195,14 +195,14 @@ export async function getNote(identifier: string): Promise<Note | null> {
 
   // Fall back to AppleScript for identifiers SQLite can't resolve
   try {
-    const esc = (s: string) => s.replace(/"/g, '\\"');
-    const result = runAS(`tell application "Notes"
+    const result = await runAppleScript(`on run argv
+tell application "Notes"
   set n to missing value
   try
-    set n to first note whose name is "${esc(identifier)}"
+    set n to first note whose name is (item 1 of argv)
   end try
   if n is missing value then try
-    set n to note id "${esc(identifier)}"
+    set n to note id (item 1 of argv)
   end try
   if n is missing value then return ""
   set attNames to ""
@@ -214,7 +214,8 @@ export async function getNote(identifier: string): Promise<Note | null> {
     set fName to name of container of n
   end try
   return (id of n) & "|||" & (name of n) & "|||" & (body of n) & "|||" & fName & "|||" & ((creation date of n) as string) & "|||" & ((modification date of n) as string) & "|||" & attNames
-end tell`);
+end tell
+end run`, [identifier]);
     if (!result.trim()) return null;
     const p = result.split("|||");
     return {
@@ -242,7 +243,7 @@ export async function searchNotes(
   query: string,
   withBody = false,
   maxChars?: number
-): Promise<{ results: (NoteRowOut | (NoteRowOut & { body: string; truncated: boolean }))[]; skipped: number }> {
+): Promise<{ results: (NoteRowOut | (NoteRowOut & { body: string; truncated: boolean }))[] }> {
   const q = query.toLowerCase();
   const all = Store.readAllNotesWithBody(); // one DB open for the whole search
   const filtered = all.filter((n) => `${n.name} ${n.body}`.toLowerCase().includes(q));
@@ -254,10 +255,10 @@ export async function searchNotes(
       if (b.length > limit) { b = b.slice(0, limit); truncated = true; }
       return { ...row, body: b, truncated };
     });
-    return { results, skipped: 0 };
+    return { results };
   }
   const results = filtered.map(({ body: _body, ...row }) => row);
-  return { results, skipped: 0 };
+  return { results };
 }
 
 export interface NoteFilter {
@@ -285,66 +286,95 @@ function matchNotes(filter: NoteFilter): Store.NoteRow[] {
   });
 }
 
-export async function countNotesWhere(
-  filter: NoteFilter
-): Promise<{ count: number; skipped: number }> {
-  return { count: matchNotes(filter).length, skipped: 0 };
+export async function countNotesWhere(filter: NoteFilter): Promise<{ count: number }> {
+  return { count: matchNotes(filter).length };
 }
 
 export async function queryNotesWhere(
   filter: NoteFilter,
   countOnly: boolean
-): Promise<{ count: number; skipped: number } | { results: NoteRowOut[]; skipped: number }> {
+): Promise<{ count: number } | { results: NoteRowOut[] }> {
   const matches = matchNotes(filter);
-  if (countOnly) return { count: matches.length, skipped: 0 };
-  return { results: matches, skipped: 0 };
+  if (countOnly) return { count: matches.length };
+  return { results: matches };
 }
 
 // ─── Write operations — AppleScript ──────────────────────────────────────────
 
 export async function createNote(name: string, body: string, folderName?: string): Promise<string> {
-  const esc = (s: string) => s.replace(/"/g, '\\"').replace(/\n/g, "\\n");
-  return runAS(`tell application "Notes"
-  set n to make new note ${folderName ? `at folder "${folderName.replace(/"/g, '\\"')}"` : ""} with properties {name:"${esc(name)}", body:"${esc(body)}"}
+  const args = [name, body];
+  let folderClause = "";
+  if (folderName) {
+    args.push(folderName);
+    folderClause = `at folder (item 3 of argv) `;
+  }
+  return runAppleScript(
+    `on run argv
+tell application "Notes"
+  set n to make new note ${folderClause}with properties {name:(item 1 of argv), body:(item 2 of argv)}
   return id of n
-end tell`);
+end tell
+end run`,
+    args
+  );
 }
 
 export async function updateNote(identifier: string, updates: { name?: string; body?: string; folderName?: string }): Promise<void> {
-  const esc = (s: string) => s.replace(/"/g, '\\"').replace(/\n/g, "\\n");
-  runAS(`tell application "Notes"
-  set n to ${asFind(identifier)}
-  ${updates.name ? `set name of n to "${esc(updates.name)}"` : ""}
-  ${updates.body !== undefined ? `set body of n to "${esc(updates.body)}"` : ""}
-  ${updates.folderName ? `move n to folder "${updates.folderName.replace(/"/g, '\\"')}"` : ""}
-end tell`);
+  const args = [identifier];
+  let script = `on run argv\ntell application "Notes"\n  set n to ${asFindClause(identifier, 1)}\n`;
+  if (updates.name !== undefined) {
+    args.push(updates.name);
+    script += `  set name of n to (item ${args.length} of argv)\n`;
+  }
+  if (updates.body !== undefined) {
+    args.push(updates.body);
+    script += `  set body of n to (item ${args.length} of argv)\n`;
+  }
+  if (updates.folderName !== undefined) {
+    args.push(updates.folderName);
+    script += `  move n to folder (item ${args.length} of argv)\n`;
+  }
+  script += `end tell\nend run`;
+  await runAppleScript(script, args);
 }
 
 export async function deleteNote(identifier: string): Promise<void> {
-  runAS(`tell application "Notes"\ndelete ${asFind(identifier)}\nend tell`);
+  await runAppleScript(
+    `on run argv\ntell application "Notes"\ndelete ${asFindClause(identifier, 1)}\nend tell\nend run`,
+    [identifier]
+  );
 }
 
 export async function createFolder(name: string): Promise<string> {
-  return runAS(`tell application "Notes"\nset f to make new folder with properties {name:"${name.replace(/"/g, '\\"')}"}\nreturn id of f\nend tell`);
+  return runAppleScript(
+    `on run argv\ntell application "Notes"\nset f to make new folder with properties {name:(item 1 of argv)}\nreturn id of f\nend tell\nend run`,
+    [name]
+  );
 }
 
 export async function moveNote(identifier: string, folderName: string): Promise<void> {
-  runAS(`tell application "Notes"\nmove ${asFind(identifier)} to folder "${folderName.replace(/"/g, '\\"')}"\nend tell`);
+  await runAppleScript(
+    `on run argv\ntell application "Notes"\nmove ${asFindClause(identifier, 1)} to folder (item 2 of argv)\nend tell\nend run`,
+    [identifier, folderName]
+  );
 }
 
 // ─── Filter-based bulk operations ─────────────────────────────────────────────
 
-function actOnIds(ids: string[], action: "delete" | { moveTo: string }): number {
+async function actOnIds(ids: string[], action: "delete" | { moveTo: string }): Promise<number> {
   if (ids.length === 0) return 0;
-  const listLiteral = ids.map((id) => `"${id.replace(/"/g, '\\"')}"`).join(", ");
-  const verb =
-    action === "delete"
-      ? "delete note id theId"
-      : `move note id theId to folder "${(action as { moveTo: string }).moveTo.replace(/"/g, '\\"')}"`;
-  const raw = runAS(`tell application "Notes"
+  const isMove = action !== "delete";
+  const args = isMove ? [...ids, (action as { moveTo: string }).moveTo] : ids;
+  // `argv` is already an AppleScript list here; when moving, the last item is
+  // the destination folder, so only the leading `ids.length` items are targets.
+  const idsExpr = isMove ? `items 1 thru ${ids.length} of argv` : "argv";
+  const verb = isMove ? `move note id theId to folder (item ${ids.length + 1} of argv)` : "delete note id theId";
+  const raw = await runAppleScript(
+    `on run argv
+tell application "Notes"
   with timeout of 600 seconds
     set cnt to 0
-    repeat with theId in {${listLiteral}}
+    repeat with theId in (${idsExpr})
       try
         ${verb}
         set cnt to cnt + 1
@@ -352,27 +382,31 @@ function actOnIds(ids: string[], action: "delete" | { moveTo: string }): number 
     end repeat
     return cnt as string
   end timeout
-end tell`);
+end tell
+end run`,
+    args,
+    620_000
+  );
   return parseInt(raw.trim() || "0", 10);
 }
 
 export async function deleteNotesWhere(
   filter: NoteFilter,
   confirm: boolean
-): Promise<{ count: number; skipped: number; confirmed: false } | { deleted: number; skipped: number; confirmed: true }> {
+): Promise<{ count: number; confirmed: false } | { deleted: number; confirmed: true }> {
   const matches = matchNotes(filter);
-  if (!confirm) return { count: matches.length, skipped: 0, confirmed: false };
-  const deleted = actOnIds(matches.map((m) => m.id), "delete");
-  return { deleted, skipped: 0, confirmed: true };
+  if (!confirm) return { count: matches.length, confirmed: false };
+  const deleted = await actOnIds(matches.map((m) => m.id), "delete");
+  return { deleted, confirmed: true };
 }
 
 export async function moveNotesWhere(
   filter: NoteFilter,
   destinationFolder: string,
   confirm: boolean
-): Promise<{ count: number; skipped: number; confirmed: false } | { moved: number; skipped: number; confirmed: true }> {
+): Promise<{ count: number; confirmed: false } | { moved: number; confirmed: true }> {
   const matches = matchNotes(filter);
-  if (!confirm) return { count: matches.length, skipped: 0, confirmed: false };
-  const moved = actOnIds(matches.map((m) => m.id), { moveTo: destinationFolder });
-  return { moved, skipped: 0, confirmed: true };
+  if (!confirm) return { count: matches.length, confirmed: false };
+  const moved = await actOnIds(matches.map((m) => m.id), { moveTo: destinationFolder });
+  return { moved, confirmed: true };
 }
