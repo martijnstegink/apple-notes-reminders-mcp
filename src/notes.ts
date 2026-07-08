@@ -308,10 +308,10 @@ export async function createNote(
   folderName?: string,
   format: NoteBodyFormat = "markdown"
 ): Promise<string> {
-  // Notes.app derives a new note's displayed title from the first line of its body
-  // at creation time — prepending the title as its own heading keeps it in sync
-  // with the `name` property regardless of what the body otherwise renders as.
-  const finalBody = `<h1>${escapeHtml(name)}</h1>` + renderBody(body, format);
+  // Notes.app itself inserts `name` as the body's literal first line when both
+  // `name:` and `body:` are given to `make new note` — prepending our own title
+  // here would duplicate it, not keep it in sync.
+  const finalBody = renderBody(body, format);
   const args = [name, finalBody];
   let folderClause = "";
   if (folderName) {
@@ -375,23 +375,31 @@ export async function updateNote(identifier: string, updates: UpdateNoteOptions)
     const mode = updates.mode ?? "replace";
     const newHtml = renderBody(updates.body, format);
 
+    // Setting `body` — in any mode — re-renders the note's HTML, and re-submitting
+    // captured attachment markup (e.g. an <img data:...> src) through the `body`
+    // setter does not actually re-attach it: the attachment becomes orphaned even
+    // though it still counts toward `attachments of n`. So no mode can safely touch
+    // body once attachments exist without an explicit opt-in.
+    const attachmentCount = await noteAttachmentCount(identifier);
+    if (attachmentCount > 0 && !updates.force) {
+      return {
+        applied: false,
+        warning:
+          `This note has ${attachmentCount} attachment(s). Setting the body in any mode ` +
+          `(replace/append/prepend) does not reliably preserve them — they may become orphaned. ` +
+          `Re-call with force=true to proceed anyway.`,
+      };
+    }
+
     if (mode === "replace") {
-      // A full body replace can't preserve attachments — we never re-embed the original
-      // attachment markup here — so require an explicit opt-in once any exist.
-      const attachmentCount = await noteAttachmentCount(identifier);
-      if (attachmentCount > 0 && !updates.force) {
-        return {
-          applied: false,
-          warning:
-            `This note has ${attachmentCount} attachment(s) that a full body replace would destroy. ` +
-            `Re-call with force=true to replace anyway, or use mode="append"/"prepend" to keep them.`,
-        };
-      }
+      // Existing note: setting `body of n` alone re-derives the displayed title from
+      // the new body's first line, so preserve the current title as an explicit heading.
       const title = updates.name ?? (await getNote(identifier))?.name ?? "";
       finalBody = `<h1>${escapeHtml(title)}</h1>` + newHtml;
     } else {
-      // append/prepend keep the note's existing raw HTML (attachments included) and
-      // just add the newly rendered content alongside it.
+      // append/prepend keep the note's existing raw HTML and add the newly rendered
+      // content alongside it — fine for preserving non-attachment formatting, but
+      // (per the guard above) not attachments themselves.
       const currentRawBody = await fetchRawBodyByIdentifier(identifier);
       finalBody =
         mode === "append"
