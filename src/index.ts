@@ -148,6 +148,59 @@ server.tool(
 );
 
 server.tool(
+  "notes_rename_folder",
+  "Rename a folder. For a nested folder use its full path from notes_list_folders (e.g. \"Recipes/Desserts\"); a plain name matches a top-level folder.",
+  { identifier: z.string().describe("Folder name, or \"/\"-separated path for a nested folder"), new_name: z.string().describe("New folder name") },
+  async ({ identifier, new_name }) => {
+    await Notes.renameFolder(identifier, new_name);
+    return { content: [{ type: "text", text: `Folder renamed to "${new_name}".` }] };
+  }
+);
+
+server.tool(
+  "notes_delete_folder",
+  "Delete a folder. Its notes move to Recently Deleted, same as deleting them individually (not permanent).",
+  { identifier: z.string().describe("Folder name, or \"/\"-separated path for a nested folder") },
+  async ({ identifier }) => {
+    await Notes.deleteFolder(identifier);
+    return { content: [{ type: "text", text: "Folder deleted." }] };
+  }
+);
+
+server.tool(
+  "notes_list_tags",
+  "List all #hashtags used across notes, with how many notes carry each. Tags are literal '#word' text Notes.app auto-links — read-only.",
+  {},
+  async () => {
+    const tags = await Notes.listTags();
+    return { content: [{ type: "text", text: tags.length ? JSON.stringify(tags, null, 2) : "No tags found." }] };
+  }
+);
+
+server.tool(
+  "notes_recently_deleted",
+  "List notes currently in Recently Deleted",
+  {},
+  async () => {
+    const results = await Notes.listRecentlyDeleted();
+    return { content: [{ type: "text", text: results.length ? JSON.stringify(results, null, 2) : "Recently Deleted is empty." }] };
+  }
+);
+
+server.tool(
+  "notes_restore_note",
+  "Restore a note out of Recently Deleted into a folder (default: \"Notes\")",
+  {
+    identifier: z.string().describe("Note id (from notes_recently_deleted)"),
+    destination_folder: z.string().optional().describe("Folder to restore into (default: \"Notes\")"),
+  },
+  async ({ identifier, destination_folder }) => {
+    await Notes.restoreNote(identifier, destination_folder);
+    return { content: [{ type: "text", text: `Note restored to "${destination_folder ?? "Notes"}".` }] };
+  }
+);
+
+server.tool(
   "notes_move",
   "Move a note to a different folder",
   { identifier: z.string().describe("Note name or ID"), folder: z.string().describe("Destination folder") },
@@ -497,14 +550,15 @@ server.tool(
 const noteFilterShape = {
   folder: z.string().optional().describe("Restrict to this folder"),
   search: z.string().optional().describe("Substring matched against title and body"),
+  tag: z.string().optional().describe("Match notes carrying this #hashtag (with or without the leading #)"),
 };
 
 server.tool(
   "notes_query_where",
-  "Count or list notes matching a word-based filter (folder, search text). Use count_only to preview how many a filter matches before a bulk action.",
+  "Count or list notes matching a word-based filter (folder, search text, tag). Use count_only to preview how many a filter matches before a bulk action.",
   { ...noteFilterShape, count_only: z.boolean().optional().describe("Return only the match count instead of full notes (default false)") },
-  async ({ folder, search, count_only }) => {
-    const result = await Notes.queryNotesWhere({ folder, search }, count_only ?? false);
+  async ({ folder, search, tag, count_only }) => {
+    const result = await Notes.queryNotesWhere({ folder, search, tag }, count_only ?? false);
     if ("count" in result) {
       return { content: [{ type: "text", text: JSON.stringify({ count: result.count }, null, 2) }] };
     }
@@ -517,8 +571,8 @@ server.tool(
   "notes_delete_where",
   "Delete all notes matching a word-based filter. SAFETY: without confirm=true, returns only the match count and deletes nothing — call again with confirm=true to delete.",
   { ...noteFilterShape, confirm: z.boolean().optional().describe("Set true to actually delete; otherwise returns the count only") },
-  async ({ folder, search, confirm }) => {
-    const r = await Notes.deleteNotesWhere({ folder, search }, confirm ?? false);
+  async ({ folder, search, tag, confirm }) => {
+    const r = await Notes.deleteNotesWhere({ folder, search, tag }, confirm ?? false);
     if (!r.confirmed) {
       return { content: [{ type: "text", text: `${r.count} note(s) match. Re-call with confirm=true to delete them.` }] };
     }
@@ -534,8 +588,8 @@ server.tool(
     destination_folder: z.string().describe("Name of the folder to move matching notes into"),
     confirm: z.boolean().optional().describe("Set true to actually move; otherwise returns the count only"),
   },
-  async ({ folder, search, destination_folder, confirm }) => {
-    const r = await Notes.moveNotesWhere({ folder, search }, destination_folder, confirm ?? false);
+  async ({ folder, search, tag, destination_folder, confirm }) => {
+    const r = await Notes.moveNotesWhere({ folder, search, tag }, destination_folder, confirm ?? false);
     if (!r.confirmed) {
       return { content: [{ type: "text", text: `${r.count} note(s) match. Re-call with confirm=true to move them to "${destination_folder}".` }] };
     }

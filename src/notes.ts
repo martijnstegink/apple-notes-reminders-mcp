@@ -15,6 +15,9 @@ export interface Note {
 export interface NoteFolder {
   id: string;
   name: string;
+  path: string;
+  account: string;
+  isSmartFolder: boolean;
   noteCount: number;
 }
 
@@ -31,6 +34,45 @@ function asFindClause(identifier: string, argIndex: number): string {
   return isNoteId(identifier)
     ? `note id (item ${argIndex} of argv)`
     : `first note whose name is (item ${argIndex} of argv)`;
+}
+
+// Resolves a "/"-separated folder path (from argv[argIndex]) into `varName`,
+// walking one path segment at a time. Two AppleScript quirks forced this shape
+// (confirmed live against Notes.app): (1) top-level lookups are reliable via
+// `first folder whose name is X`, but that same `whose` filter — and
+// `folder id "..."` — become unreliable (intermittent "item N of every folder
+// kan niet worden opgevraagd" errors, sometimes on folders that plainly
+// exist) once a nested sub-folder is involved; a hand-rolled `repeat...every
+// folder of <parent>` scan is what reliably finds those instead. (2) the
+// top-level `folder`/`every folder` collection only contains top-level
+// folders — nested ones only appear via `every folder of <parent>` — so the
+// manual scan is required for segIdx > 1 regardless.
+function folderResolveScript(argIndex: number, varName: string): string {
+  return `
+  set savedTID to AppleScript's text item delimiters
+  set AppleScript's text item delimiters to "/"
+  set pathParts to text items of (item ${argIndex} of argv)
+  set AppleScript's text item delimiters to savedTID
+  set ${varName} to missing value
+  repeat with segIdx from 1 to (count of pathParts)
+    set seg to item segIdx of pathParts
+    set found to missing value
+    if segIdx = 1 then
+      try
+        set found to first folder whose name is seg
+      end try
+    else
+      repeat with candidate in (every folder of ${varName})
+        if name of candidate is seg then
+          set found to candidate
+          exit repeat
+        end if
+      end repeat
+    end if
+    if found is missing value then error "Folder not found: " & (item ${argIndex} of argv)
+    set ${varName} to found
+  end repeat
+`;
 }
 
 // ─── HTML → plain text (AppleScript body fallback) ───────────────────────────
@@ -262,20 +304,34 @@ export async function searchNotes(
   return { results };
 }
 
+// Notes stores hashtags as literal "#word" text in the note body (Notes.app
+// auto-links them on its own — see markdown.ts) rather than as a queryable
+// DB relationship, so tags are derived by scanning decoded bodies.
+const TAG_RE = /#([\p{L}\p{N}_]+)/gu;
+
+function extractTags(body: string): Set<string> {
+  const tags = new Set<string>();
+  for (const m of body.matchAll(TAG_RE)) tags.add(m[1].toLowerCase());
+  return tags;
+}
+
 export interface NoteFilter {
   folder?: string;
   search?: string;
+  tag?: string;
 }
 
 function matchNotes(filter: NoteFilter): Store.NoteRow[] {
   const q = (filter.search ?? "").toLowerCase();
-  const needsBody = q.length > 0;
+  const tag = filter.tag?.replace(/^#/, "").toLowerCase();
+  const needsBody = q.length > 0 || !!tag;
 
   if (needsBody) {
     const all = Store.readAllNotesWithBody();
     return all.filter((n) => {
       if (filter.folder && n.folder !== filter.folder) return false;
       if (q && !`${n.name} ${n.body}`.toLowerCase().includes(q)) return false;
+      if (tag && !extractTags(n.body).has(tag)) return false;
       return true;
     });
   }
@@ -285,6 +341,25 @@ function matchNotes(filter: NoteFilter): Store.NoteRow[] {
     if (filter.folder && n.folder !== filter.folder) return false;
     return true;
   });
+}
+
+export async function listTags(): Promise<{ tag: string; noteCount: number }[]> {
+  const all = Store.readAllNotesWithBody();
+  const counts = new Map<string, number>();
+  for (const n of all) {
+    for (const tag of extractTags(n.body)) counts.set(tag, (counts.get(tag) ?? 0) + 1);
+  }
+  return [...counts.entries()]
+    .map(([tag, noteCount]) => ({ tag, noteCount }))
+    .sort((a, b) => b.noteCount - a.noteCount || a.tag.localeCompare(b.tag));
+}
+
+export async function listRecentlyDeleted(): Promise<NoteRowOut[]> {
+  return Store.readRecentlyDeleted().map(({ body: _body, ...row }) => row);
+}
+
+export async function restoreNote(identifier: string, destinationFolder = "Notes"): Promise<void> {
+  await moveNote(identifier, destinationFolder);
 }
 
 export async function countNotesWhere(filter: NoteFilter): Promise<{ count: number }> {
@@ -440,6 +515,41 @@ export async function createFolder(name: string): Promise<string> {
     [name]
   );
 }
+
+export async function renameFolder(identifier: string, newName: string): Promise<void> {
+  await runAppleScript(
+    `on run argv
+tell application "Notes"
+${folderResolveScript(1, "f")}
+  set name of f to (item 2 of argv)
+end tell
+end run`,
+    [identifier, newName]
+  );
+}
+
+// Deletes the folder and moves its notes to Recently Deleted (Notes.app's own
+// behavior for folder deletion — not a permanent, unrecoverable delete).
+export async function deleteFolder(identifier: string): Promise<void> {
+  await runAppleScript(
+    `on run argv
+tell application "Notes"
+${folderResolveScript(1, "f")}
+  delete f
+end tell
+end run`,
+    [identifier]
+  );
+}
+
+// No moveFolder (re-parenting): confirmed live that Notes.app's AppleScript
+// `move <folder> to <folder>` is unreliable — it sometimes throws
+// "item N of every folder kan niet worden opgevraagd" and sometimes silently
+// no-ops, whether the folder reference comes from `folder id`, a `whose`
+// filter, or a hand-rolled `repeat...every folder` scan (all three were
+// tried). Renaming and deleting a folder are reliable (tested above);
+// shipping a re-parent tool that fails unpredictably would be worse than not
+// having one, so it's intentionally not implemented.
 
 export async function moveNote(identifier: string, folderName: string): Promise<void> {
   await runAppleScript(
