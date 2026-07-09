@@ -7,8 +7,12 @@ Swift EventKit daemon (NDJSON over stdio) for Reminders.
 ## Working rules
 - Work ONE phase at a time. Build (`npm run build`) and test after every
   change. Commit when the phase is done, then stop and summarize.
-- Live tests: only use the Notes folder "MCP-Test" and Reminders list
-  "MCP-Test". Never modify or delete anything else. Clean up test data.
+- Live tests: create a fresh Notes folder and Reminders list per test run,
+  with a unique name (e.g. "MCP-Test-<timestamp>") — never a shared/
+  persistent "MCP-Test" list/folder reused across runs, since that's what
+  produced a pile of duplicate empty Reminders lists over time. Never
+  modify or delete anything else. Delete the run's folder and list
+  completely at the end, in a finally/afterAll, even if the run fails.
 - Never string-splice user content into AppleScript. Pass via argv.
 
 ## Phase 1 — Reliability foundation

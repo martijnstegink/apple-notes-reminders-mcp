@@ -28,7 +28,7 @@ npm run build && node scripts/test-schema-detection.mjs    # schema-detection sa
 
 `scripts/test-schema-detection.mjs` imports `dist/notesStore.js` and asserts invariants (non-empty folder path/id/account, Recently Deleted excluded, valid date parsing, etc.) against whatever real Notes database is present — like `test-phase2.mjs`'s "Real DB notes" section, this needs Full Disk Access and actual note/folder data, so failures on a fresh or empty library are expected rather than a regression signal.
 
-There is a manual/live-verification convention for AppleScript- and daemon-backed write paths (Notes create/update/delete/move, Reminders create/update/subtasks): exercise them only against a Notes folder and Reminders list both named `MCP-Test`, never against real data, and clean up test items afterward.
+There is a manual/live-verification convention for AppleScript- and daemon-backed write paths (Notes create/update/delete/move, Reminders create/update/subtasks): exercise them only against a Notes folder and Reminders list created fresh for that run, with a unique name (e.g. `MCP-Test-<timestamp>`) — never against real data, and never a shared/persistent `MCP-Test` list or folder reused across runs, since that's exactly what produced a pile of duplicate empty `MCP-Test` Reminders lists over time. Delete both the folder and the list completely at the end of the run — in a `finally`/`afterAll` so cleanup still happens even if the run fails partway through.
 
 ## Architecture
 
