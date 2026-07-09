@@ -21,6 +21,14 @@ export interface NoteRecord extends NoteRow {
   attachments: string[];
 }
 
+export interface AttachmentInfo {
+  id: string; // media identifier when available (else the attachment's own identifier) — pass to readAttachmentByIdentifier
+  filename: string;
+  typeUTI: string; // e.g. "public.jpeg", "com.apple.notes.table", "com.adobe.pdf"
+  filePath: string | null; // absolute path on disk; null if the media file/generation folder couldn't be resolved
+  ocrText: string | null; // recognized text from an image attachment; null if none
+}
+
 export interface FolderRecord {
   id: string;
   name: string;
@@ -263,6 +271,9 @@ interface SchemaInfo {
   colPinned: string | null; // note pinned flag
   colFolderType: string | null; // distinguishes special folders (e.g. Recently Deleted) from regular ones
   accountNames: Map<number, string>; // account Z_PK -> display name (e.g. "iCloud")
+  accountIdentifiers: Map<number, string>; // account Z_PK -> ZIDENTIFIER (folder name under Accounts/ on disk)
+  entAttachment: number | null; // Z_ENT for ICAttachment rows
+  entMedia: number | null; // Z_ENT for ICMedia rows
 }
 
 function detectSchema(db: Database.Database): SchemaInfo {
@@ -351,22 +362,42 @@ function detectSchema(db: Database.Database): SchemaInfo {
     }
   }
 
-  // Account display names: ICAccount rows live in the same unified table, keyed by
-  // a dynamically-resolved Z_ENT (its numeric value shifts across schema versions).
+  // Account display names + identifiers: ICAccount rows live in the same unified
+  // table, keyed by a dynamically-resolved Z_ENT (its numeric value shifts across
+  // schema versions). ZIDENTIFIER is the account's folder name under
+  // Accounts/ on disk — needed to resolve attachment file paths.
   const accountNames = new Map<number, string>();
+  const accountIdentifiers = new Map<number, string>();
   try {
     const entRow = db.prepare("SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = 'ICAccount'").get() as
       | { Z_ENT: number }
       | undefined;
     if (entRow) {
       const rows = db
-        .prepare(`SELECT Z_PK, ZNAME FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ?`)
-        .all(entRow.Z_ENT) as { Z_PK: number; ZNAME: string | null }[];
-      rows.forEach((r) => accountNames.set(r.Z_PK, r.ZNAME ?? ""));
+        .prepare(`SELECT Z_PK, ZNAME, ZIDENTIFIER FROM ZICCLOUDSYNCINGOBJECT WHERE Z_ENT = ?`)
+        .all(entRow.Z_ENT) as { Z_PK: number; ZNAME: string | null; ZIDENTIFIER: string | null }[];
+      rows.forEach((r) => {
+        accountNames.set(r.Z_PK, r.ZNAME ?? "");
+        if (r.ZIDENTIFIER) accountIdentifiers.set(r.Z_PK, r.ZIDENTIFIER);
+      });
     }
   } catch {
     // proceed without account names
   }
+
+  // Attachment/media entity ids, resolved the same dynamic way as ICAccount above.
+  function resolveEnt(name: string): number | null {
+    try {
+      const row = db.prepare("SELECT Z_ENT FROM Z_PRIMARYKEY WHERE Z_NAME = ?").get(name) as
+        | { Z_ENT: number }
+        | undefined;
+      return row?.Z_ENT ?? null;
+    } catch {
+      return null;
+    }
+  }
+  const entAttachment = resolveEnt("ICAttachment");
+  const entMedia = resolveEnt("ICMedia");
 
   // Detect recently-deleted folder PKs
   const recentlyDeletedPk = new Set<number>();
@@ -421,6 +452,9 @@ function detectSchema(db: Database.Database): SchemaInfo {
     colPinned,
     colFolderType,
     accountNames,
+    accountIdentifiers,
+    entAttachment,
+    entMedia,
   };
 }
 
@@ -695,6 +729,166 @@ export function readFolderWithBodies(
         }
         return { ...base, body, truncated };
       });
+  } finally {
+    cleanup();
+  }
+}
+
+// Attachment media files live at:
+//   Accounts/{account ZIDENTIFIER}/Media/{media ZIDENTIFIER}/{media ZGENERATION1}/{media ZFILENAME}
+// (confirmed live against a real library). accountPk should come from the
+// note's folder, not the attachment's own account column — that column has
+// been renumbered across schema versions the same way folders' has, and
+// piggybacking on the already-detected folder->account link avoids detecting
+// it a second time.
+function buildAttachmentFilePath(
+  schema: SchemaInfo,
+  accountPk: number | null,
+  mediaIdentifier: string | null,
+  generation: string | null,
+  filename: string | null
+): string | null {
+  if (accountPk == null || !mediaIdentifier || !filename) return null;
+  const accountId = schema.accountIdentifiers.get(accountPk);
+  if (!accountId) return null;
+  const filePath = join(
+    homedir(),
+    "Library/Group Containers/group.com.apple.notes/Accounts",
+    accountId,
+    "Media",
+    mediaIdentifier,
+    generation ?? "",
+    filename
+  );
+  return existsSync(filePath) ? filePath : null;
+}
+
+interface RawAttachmentRow {
+  att_id: string | null;
+  type_uti: string | null;
+  ocr: string | null;
+  media_id: string | null;
+  filename: string | null;
+  generation: string | null;
+}
+
+function rowToAttachmentInfo(r: RawAttachmentRow, schema: SchemaInfo, accountPk: number | null): AttachmentInfo {
+  return {
+    id: r.media_id ?? r.att_id ?? "",
+    filename: r.filename ?? "",
+    typeUTI: r.type_uti ?? "",
+    filePath: buildAttachmentFilePath(schema, accountPk, r.media_id, r.generation, r.filename),
+    ocrText: r.ocr && r.ocr.trim() ? r.ocr.trim() : null,
+  };
+}
+
+// Bulk OCR text per note (one attachment scan, not one query per note) — used
+// to fold image-recognized text into the searchable corpus for notes_search.
+export function readOcrTextByNote(): Map<number, string> {
+  const { db, cleanup } = openDb();
+  try {
+    const schema = detectSchema(db);
+    const map = new Map<number, string>();
+    if (schema.entAttachment == null) return map;
+    const deletedFilter = schema.colDeleted
+      ? `AND (${schema.colDeleted} IS NULL OR ${schema.colDeleted} = 0)`
+      : "";
+    const rows = db
+      .prepare(
+        `SELECT ZNOTE AS note_pk, ZOCRSUMMARY AS ocr
+         FROM ZICCLOUDSYNCINGOBJECT
+         WHERE Z_ENT = ? AND ZNOTE IS NOT NULL AND ZOCRSUMMARY IS NOT NULL AND ZOCRSUMMARY != '' ${deletedFilter}`
+      )
+      .all(schema.entAttachment) as { note_pk: number; ocr: string }[];
+    for (const r of rows) {
+      const prev = map.get(r.note_pk);
+      map.set(r.note_pk, prev ? `${prev} ${r.ocr}` : r.ocr);
+    }
+    return map;
+  } finally {
+    cleanup();
+  }
+}
+
+export function readAttachments(noteZpk: number): AttachmentInfo[] {
+  const { db, cleanup } = openDb();
+  try {
+    const schema = detectSchema(db);
+    if (schema.entAttachment == null) return [];
+
+    const noteRow = db
+      .prepare(`SELECT ${schema.colFolder} AS folder_pk FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?`)
+      .get(noteZpk) as { folder_pk: number | null } | undefined;
+    let accountPk: number | null = null;
+    if (noteRow?.folder_pk != null && schema.colAccount) {
+      const folderRow = db
+        .prepare(`SELECT ${schema.colAccount} AS account_pk FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?`)
+        .get(noteRow.folder_pk) as { account_pk: number | null } | undefined;
+      accountPk = folderRow?.account_pk ?? null;
+    }
+
+    const deletedFilter = schema.colDeleted
+      ? `AND (a.${schema.colDeleted} IS NULL OR a.${schema.colDeleted} = 0)`
+      : "";
+    const mediaJoin = schema.entMedia != null ? "LEFT JOIN ZICCLOUDSYNCINGOBJECT m ON m.Z_PK = a.ZMEDIA" : "";
+    const mediaCols = schema.entMedia != null
+      ? "m.ZIDENTIFIER AS media_id, m.ZFILENAME AS filename, m.ZGENERATION1 AS generation"
+      : "NULL AS media_id, NULL AS filename, NULL AS generation";
+
+    const rows = db
+      .prepare(
+        `SELECT a.ZIDENTIFIER AS att_id, a.ZTYPEUTI AS type_uti, a.ZOCRSUMMARY AS ocr, ${mediaCols}
+         FROM ZICCLOUDSYNCINGOBJECT a
+         ${mediaJoin}
+         WHERE a.Z_ENT = ? AND a.ZNOTE = ? ${deletedFilter}`
+      )
+      .all(schema.entAttachment, noteZpk) as RawAttachmentRow[];
+
+    return rows.map((r) => rowToAttachmentInfo(r, schema, accountPk));
+  } finally {
+    cleanup();
+  }
+}
+
+// Looks up one attachment by its media identifier (preferred — what
+// readAttachments returns as `id`) or its own attachment identifier, across
+// every note, since notes_get_attachment only receives the id.
+export function readAttachmentByIdentifier(identifier: string): AttachmentInfo | null {
+  const { db, cleanup } = openDb();
+  try {
+    const schema = detectSchema(db);
+    if (schema.entAttachment == null) return null;
+
+    const noteFolderCol = schema.colFolder;
+    const mediaJoin = schema.entMedia != null ? "LEFT JOIN ZICCLOUDSYNCINGOBJECT m ON m.Z_PK = a.ZMEDIA" : "";
+    const mediaCols = schema.entMedia != null
+      ? "m.ZIDENTIFIER AS media_id, m.ZFILENAME AS filename, m.ZGENERATION1 AS generation"
+      : "NULL AS media_id, NULL AS filename, NULL AS generation";
+
+    const row = db
+      .prepare(
+        `SELECT a.ZIDENTIFIER AS att_id, a.ZTYPEUTI AS type_uti, a.ZOCRSUMMARY AS ocr, a.ZNOTE AS note_pk, ${mediaCols}
+         FROM ZICCLOUDSYNCINGOBJECT a
+         ${mediaJoin}
+         WHERE a.Z_ENT = ? AND (a.ZIDENTIFIER = ? OR m.ZIDENTIFIER = ?)`
+      )
+      .get(schema.entAttachment, identifier, identifier) as (RawAttachmentRow & { note_pk: number | null }) | undefined;
+    if (!row) return null;
+
+    let accountPk: number | null = null;
+    if (row.note_pk != null) {
+      const noteRow = db
+        .prepare(`SELECT ${noteFolderCol} AS folder_pk FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?`)
+        .get(row.note_pk) as { folder_pk: number | null } | undefined;
+      if (noteRow?.folder_pk != null && schema.colAccount) {
+        const folderRow = db
+          .prepare(`SELECT ${schema.colAccount} AS account_pk FROM ZICCLOUDSYNCINGOBJECT WHERE Z_PK = ?`)
+          .get(noteRow.folder_pk) as { account_pk: number | null } | undefined;
+        accountPk = folderRow?.account_pk ?? null;
+      }
+    }
+
+    return rowToAttachmentInfo(row, schema, accountPk);
   } finally {
     cleanup();
   }

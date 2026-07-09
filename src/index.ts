@@ -1,6 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
+import { readFileSync, statSync } from "fs";
 
 import * as Notes from "./notes.js";
 import * as Reminders from "./reminders.js";
@@ -26,13 +27,49 @@ server.tool(
 
 server.tool(
   "notes_get",
-  "Get a note by name or ID",
+  "Get a note by name or ID. `attachments` lists each attachment's id, filename, type, and any recognized " +
+  "OCR text (for images with text in them) — pass an attachment's id to notes_get_attachment to fetch the image itself.",
   { identifier: z.string().describe("Note name or ID") },
   async ({ identifier }) => {
     const note = await Notes.getNote(identifier);
     return note
       ? { content: [{ type: "text", text: JSON.stringify(note, null, 2) }] }
       : { content: [{ type: "text", text: `Note not found: ${identifier}` }], isError: true };
+  }
+);
+
+const IMAGE_MIME_BY_UTI: Record<string, string> = {
+  "public.jpeg": "image/jpeg",
+  "public.png": "image/png",
+  "com.compuserve.gif": "image/gif",
+  "org.webmproject.webp": "image/webp",
+  "public.heic": "image/heic",
+  "public.svg-image": "image/svg+xml",
+};
+
+const MAX_ATTACHMENT_BYTES = 20 * 1024 * 1024; // guard against handing a huge file to the MCP client as inline base64
+
+server.tool(
+  "notes_get_attachment",
+  "Fetch an image attachment's content as an MCP image block, given the attachment id from notes_get's `attachments` list. " +
+  "Only image types are supported (jpeg/png/gif/webp/heic/svg) — other attachment types (PDF, embedded tables, etc.) return their metadata as text instead.",
+  { id: z.string().describe("Attachment id (from notes_get's attachments[].id)") },
+  async ({ id }) => {
+    const att = await Notes.getAttachment(id);
+    if (!att) return { content: [{ type: "text", text: `Attachment not found: ${id}` }], isError: true };
+    if (!att.filePath) {
+      return { content: [{ type: "text", text: `Attachment "${att.filename}" (${att.typeUTI}) has no resolvable file on disk.` }], isError: true };
+    }
+    const mimeType = IMAGE_MIME_BY_UTI[att.typeUTI];
+    if (!mimeType) {
+      return { content: [{ type: "text", text: `Attachment "${att.filename}" is type ${att.typeUTI}, not a supported image type.` }] };
+    }
+    const size = statSync(att.filePath).size;
+    if (size > MAX_ATTACHMENT_BYTES) {
+      return { content: [{ type: "text", text: `Attachment "${att.filename}" is ${Math.round(size / 1024 / 1024)}MB, over the ${MAX_ATTACHMENT_BYTES / 1024 / 1024}MB inline limit.` }], isError: true };
+    }
+    const data = readFileSync(att.filePath).toString("base64");
+    return { content: [{ type: "image", data, mimeType }] };
   }
 );
 
@@ -60,7 +97,7 @@ server.tool(
 
 server.tool(
   "notes_search",
-  "Search notes by title or content across all folders. " +
+  "Search notes by title, body, or recognized text in image attachments (OCR), across all folders. " +
   "Use with_body: true to include the decoded body of each matching note " +
   "(checklist items render as - [x] / - [ ], same encoding as notes_get). " +
   "Prefer notes_get_folder when the folder is known and you want all its notes; " +

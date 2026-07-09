@@ -2,6 +2,26 @@ import * as Store from "./notesStore.js";
 import { runAppleScript } from "./applescript.js";
 import { escapeHtml, renderBody, type NoteBodyFormat } from "./markdown.js";
 
+// Research spike: adding images to a note via the `shortcuts` CLI bridge.
+// Not implemented — confirmed not viable as a zero-setup MCP tool:
+//   - `shortcuts run <name> -i <path>` takes exactly one input (a file) and one
+//     output path; there's no flag to also pass a target note name/id alongside
+//     the image, so a workflow would have to smuggle it in some other way (e.g.
+//     encoding the note identifier into the input file's name for the shortcut
+//     to parse back out — fragile, and still requires the shortcut to contain a
+//     "Find Notes" + "Add to Note" action pair).
+//   - The `shortcuts` CLI can only run/list/view/sign shortcuts that already
+//     exist (confirmed via `shortcuts --help`) — there's no `create` subcommand.
+//     Authoring one programmatically means hand-building Apple's WFWorkflow
+//     plist format for Notes-specific actions, which isn't documented and would
+//     be its own multi-day reverse-engineering effort.
+//   - Even if built, invoking it would depend on a *user-authored* Shortcut
+//     existing on their machine ahead of time — not something this server can
+//     set up on its own, so it wouldn't actually be a zero-setup capability.
+// Conclusion: not worth the fragility for what it would unlock. Attachments
+// remain read-only from this server's side (see readAttachments/getAttachment
+// below); adding one still requires the Notes.app UI.
+
 export interface Note {
   id: string;
   name: string;
@@ -9,7 +29,12 @@ export interface Note {
   folder: string;
   creationDate: string;
   modificationDate: string;
-  attachments: string[];
+  attachments: Store.AttachmentInfo[];
+}
+
+function zpkFromNoteId(id: string): number | null {
+  const match = id.match(/ICNote\/p(\d+)/);
+  return match ? parseInt(match[1], 10) : null;
 }
 
 export interface NoteFolder {
@@ -225,6 +250,7 @@ export async function getNote(identifier: string): Promise<Note | null> {
       const html = await fetchBodyViaAppleScript(found.id);
       if (html) body = htmlToPlainText(html);
     }
+    const zpk = zpkFromNoteId(found.id);
     return {
       id: found.id,
       name: found.name,
@@ -232,7 +258,7 @@ export async function getNote(identifier: string): Promise<Note | null> {
       folder: found.folder,
       creationDate: found.creationDate,
       modificationDate: found.modificationDate,
-      attachments: [],
+      attachments: zpk != null ? Store.readAttachments(zpk) : [],
     };
   }
 
@@ -268,11 +294,20 @@ end run`, [identifier]);
       folder: p[3]?.trim() ?? "",
       creationDate: p[4]?.trim() ?? "",
       modificationDate: p[5]?.trim() ?? "",
-      attachments: (p[6] ?? "").split(";;;").filter((a) => a.trim()).map((a) => a.trim()),
+      // AppleScript's `attachments of n` only exposes a name — no id/typeUTI/OCR,
+      // unlike the Store.readAttachments() path used above for SQLite-resolved notes.
+      attachments: (p[6] ?? "")
+        .split(";;;")
+        .filter((a) => a.trim())
+        .map((a) => ({ id: "", filename: a.trim(), typeUTI: "", filePath: null, ocrText: null })),
     };
   } catch {
     return null;
   }
+}
+
+export async function getAttachment(id: string): Promise<Store.AttachmentInfo | null> {
+  return Store.readAttachmentByIdentifier(id);
 }
 
 export async function getFolderWithBodies(
@@ -289,7 +324,12 @@ export async function searchNotes(
 ): Promise<{ results: (NoteRowOut | (NoteRowOut & { body: string; truncated: boolean }))[] }> {
   const q = query.toLowerCase();
   const all = Store.readAllNotesWithBody(); // one DB open for the whole search
-  const filtered = all.filter((n) => `${n.name} ${n.body}`.toLowerCase().includes(q));
+  const ocrByNote = Store.readOcrTextByNote(); // fold recognized text from image attachments into the search corpus
+  const filtered = all.filter((n) => {
+    const zpk = zpkFromNoteId(n.id);
+    const ocr = zpk != null ? (ocrByNote.get(zpk) ?? "") : "";
+    return `${n.name} ${n.body} ${ocr}`.toLowerCase().includes(q);
+  });
   if (withBody) {
     const limit = maxChars ?? 300;
     const results = filtered.map(({ body, ...row }) => {
@@ -328,9 +368,14 @@ function matchNotes(filter: NoteFilter): Store.NoteRow[] {
 
   if (needsBody) {
     const all = Store.readAllNotesWithBody();
+    const ocrByNote = q ? Store.readOcrTextByNote() : null;
     return all.filter((n) => {
       if (filter.folder && n.folder !== filter.folder) return false;
-      if (q && !`${n.name} ${n.body}`.toLowerCase().includes(q)) return false;
+      if (q) {
+        const zpk = zpkFromNoteId(n.id);
+        const ocr = (zpk != null && ocrByNote) ? (ocrByNote.get(zpk) ?? "") : "";
+        if (!`${n.name} ${n.body} ${ocr}`.toLowerCase().includes(q)) return false;
+      }
       if (tag && !extractTags(n.body).has(tag)) return false;
       return true;
     });
