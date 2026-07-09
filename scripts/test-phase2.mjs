@@ -333,9 +333,13 @@ console.log('\n=== 4. Fallback path (decodeNoteBody with garbage) ===');
 
 import { createRequire } from 'module';
 import { createGunzip } from 'zlib';
-import { gunzipSync, inflateSync } from 'zlib';
+import { gunzipSync, inflateSync, deflateSync } from 'zlib';
 
-// Inline version of decodeNoteBody for testing
+// Inline version of decodeNoteBody for testing — mirrors notesStore.ts's
+// decodeNoteBody exactly, including the applyTodoMarkers pass, so the
+// "pinned fixture" tests below exercise the same full pipeline production
+// code runs (gunzip -> field2 -> field3 -> field2 text -> checklist markers),
+// not just the field-navigation error branches.
 function decodeNoteBody(data) {
   let decompressed;
   try { decompressed = gunzipSync(data); }
@@ -346,7 +350,7 @@ function decodeNoteBody(data) {
   if (!noteTextMsg) return 'FIELD3_MISSING';
   const textBytes = findField(noteTextMsg, 2);
   if (!textBytes) return 'TEXTFIELD_MISSING';
-  return textBytes.toString('utf8');
+  return applyTodoMarkers(textBytes.toString('utf8'), noteTextMsg);
 }
 
 test('garbage blob → fallback triggered (empty string from real fn)', decodeNoteBody(Buffer.from('this is garbage')), 'FALLBACK_TRIGGERED');
@@ -359,6 +363,60 @@ import { gzipSync } from 'zlib';
   const inner = Buffer.concat([vf(3, 99)]); // field3 varint at top level — no field2
   const blob = gzipSync(inner);
   test('valid gzip but no outer field2 → FIELD2_MISSING', decodeNoteBody(blob), 'FIELD2_MISSING');
+}
+
+// ── Section 7b: Pinned full-pipeline fixtures ──────────────────────────────────
+// Full gzip(top-level field2 -> outer-doc field3 -> note_text field2 text,
+// field5 checklist entries) documents, built once and asserted byte-for-byte —
+// exercises the whole decode pipeline end to end without depending on the
+// live Notes.app database (unlike the "Real DB notes" section below, which
+// only works on the original author's machine).
+
+console.log('\n=== 4b. Pinned full-pipeline fixtures ===');
+
+function buildTopLevelBlob(noteTextMsg) {
+  const outerDoc = ld(3, noteTextMsg); // outer-doc field 3 = note_text_message
+  const topLevel = ld(2, outerDoc); // top-level field 2 = outer document
+  return gzipSync(topLevel);
+}
+
+{
+  // Plain note, no checklist entries at all.
+  const text = 'Shopping list\nMilk\nEggs';
+  const msg = buildNoteTextMsg(text, []);
+  const blob = buildTopLevelBlob(msg);
+  test('pinned fixture: plain note round-trips unchanged', decodeNoteBody(blob), text);
+}
+
+{
+  // Mixed checklist + plain paragraph, gzip-compressed exactly as Notes.app stores it.
+  const text = 'Groceries\nBuy milk\nBuy eggs\nRemember reusable bags';
+  const msg = buildNoteTextMsg(text, [
+    plainEntry(10),      // 'Groceries\n'
+    todoEntry(9, true),  // 'Buy milk\n'
+    todoEntry(9, false), // 'Buy eggs\n'
+    plainEntry(23),      // 'Remember reusable bags'
+  ]);
+  const blob = buildTopLevelBlob(msg);
+  const result = decodeNoteBody(blob);
+  const lines = result.split('\n');
+  test('pinned fixture: title line unchanged', lines[0], 'Groceries');
+  test('pinned fixture: checked item', lines[1], '- [x] Buy milk');
+  test('pinned fixture: unchecked item', lines[2], '- [ ] Buy eggs');
+  test('pinned fixture: trailing plain paragraph unchanged', lines[3], 'Remember reusable bags');
+}
+
+{
+  // zlib-deflate fallback path — decodeNoteBody tries gunzip first, then
+  // inflateSync, before giving up. Confirms the fallback branch also runs the
+  // same field-navigation + checklist-marker pipeline, not just gunzip's.
+  const text = 'Deflate path\nItem one';
+  const msg = buildNoteTextMsg(text, [plainEntry(13), todoEntry(8, true)]);
+  const outerDoc = ld(3, msg);
+  const topLevel = ld(2, outerDoc);
+  const blob = deflateSync(topLevel);
+  const result = decodeNoteBody(blob);
+  test('pinned fixture: inflate-fallback path decodes correctly', result, 'Deflate path\n- [x] Item one');
 }
 
 // ── Section 8: Right-trim cosmetic ────────────────────────────────────────────

@@ -4,6 +4,8 @@ import * as chrono from "chrono-node";
 import { fileURLToPath } from "url";
 import { randomUUID } from "crypto";
 import path from "path";
+import { homedir } from "os";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "fs";
 import { runAppleScript } from "./applescript.js";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -137,6 +139,7 @@ export interface Reminder {
   flagged?: boolean;
   isRecurring?: boolean;
   recurrence?: { frequency: string; interval: number };
+  modifiedDate?: string;
 }
 
 export interface RecurrenceInput {
@@ -246,15 +249,43 @@ export async function renameReminderList(name: string, newName: string): Promise
 // well over 90s on a real library (380 reminders across 20 lists — AppleScript's
 // per-property IPC overhead dominates), so listReminders/searchReminders across
 // *all* lists intentionally omit `flagged` rather than pay that tax on every call.
+export type ReminderSort = "modified_desc" | "modified_asc" | "due_asc" | "due_desc" | "name_asc" | "name_desc";
+
+function sortReminders(rows: Reminder[], sort: ReminderSort = "modified_desc"): Reminder[] {
+  const sorted = [...rows];
+  const byDate = (key: "modifiedDate" | "dueDate", dir: 1 | -1) =>
+    sorted.sort((a, b) => dir * ((a[key] ?? "").localeCompare(b[key] ?? "")));
+  switch (sort) {
+    case "modified_asc": byDate("modifiedDate", 1); break;
+    case "due_asc": byDate("dueDate", 1); break;
+    case "due_desc": byDate("dueDate", -1); break;
+    case "name_asc": sorted.sort((a, b) => a.name.localeCompare(b.name)); break;
+    case "name_desc": sorted.sort((a, b) => b.name.localeCompare(a.name)); break;
+    case "modified_desc":
+    default: byDate("modifiedDate", -1);
+  }
+  return sorted;
+}
+
+function paginateReminders<T>(rows: T[], limit?: number, offset?: number): T[] {
+  const start = offset ?? 0;
+  return limit != null ? rows.slice(start, start + limit) : rows.slice(start);
+}
+
 export async function listReminders(options: {
   listName?: string;
   includeCompleted?: boolean;
-}): Promise<Reminder[]> {
+  sort?: ReminderSort;
+  limit?: number;
+  offset?: number;
+}): Promise<{ results: Reminder[]; total: number }> {
   const r = (await call("list-reminders", {
     listName: options.listName,
     includeCompleted: options.includeCompleted ?? false,
   })) as Reminder[];
-  return options.listName ? mergeFlagged(r, options.listName) : r;
+  const merged = options.listName ? await mergeFlagged(r, options.listName) : r;
+  const sorted = sortReminders(merged, options.sort);
+  return { results: paginateReminders(sorted, options.limit, options.offset), total: sorted.length };
 }
 
 export async function getReminder(identifier: string): Promise<Reminder | null> {
@@ -603,4 +634,105 @@ end run`,
     [parentId, subtaskId, String(completed)],
     SUBTASK_TIMEOUT_MS
   );
+}
+
+// ─── Local JSON persistence (templates + saved views) ─────────────────────────
+// Server-side emulation — Reminders/EventKit has no template or named-filter
+// concept of its own, so these are just JSON files under the user's home dir.
+
+const STORE_DIR = path.join(homedir(), ".apple-notes-reminders-mcp");
+
+function loadJsonStore<T>(filename: string): Record<string, T> {
+  const file = path.join(STORE_DIR, filename);
+  if (!existsSync(file)) return {};
+  try {
+    return JSON.parse(readFileSync(file, "utf8"));
+  } catch {
+    return {};
+  }
+}
+
+function saveJsonStore<T>(filename: string, data: Record<string, T>): void {
+  if (!existsSync(STORE_DIR)) mkdirSync(STORE_DIR, { recursive: true });
+  writeFileSync(path.join(STORE_DIR, filename), JSON.stringify(data, null, 2));
+}
+
+// ─── Reminder templates ─────────────────────────────────────────────────────
+
+export interface ReminderTemplateFields {
+  name: string;
+  body?: string;
+  listName?: string;
+  dueDateInput?: string;
+  priority?: number;
+  url?: string;
+  flagged?: boolean;
+  recurrence?: RecurrenceInput;
+  earlyAlarmMinutes?: number[];
+  locationAlarm?: LocationAlarmInput;
+}
+
+const TEMPLATES_FILE = "reminder-templates.json";
+
+export async function saveReminderTemplate(templateName: string, fields: ReminderTemplateFields): Promise<void> {
+  const store = loadJsonStore<ReminderTemplateFields>(TEMPLATES_FILE);
+  store[templateName] = fields;
+  saveJsonStore(TEMPLATES_FILE, store);
+}
+
+export async function listReminderTemplates(): Promise<Array<{ name: string; fields: ReminderTemplateFields }>> {
+  const store = loadJsonStore<ReminderTemplateFields>(TEMPLATES_FILE);
+  return Object.entries(store).map(([name, fields]) => ({ name, fields }));
+}
+
+export async function deleteReminderTemplate(templateName: string): Promise<boolean> {
+  const store = loadJsonStore<ReminderTemplateFields>(TEMPLATES_FILE);
+  if (!(templateName in store)) return false;
+  delete store[templateName];
+  saveJsonStore(TEMPLATES_FILE, store);
+  return true;
+}
+
+// Overrides are shallow-merged over the saved template (e.g. supply a fresh
+// due_date each time while everything else — body, priority, recurrence —
+// comes from the template).
+export async function createReminderFromTemplate(
+  templateName: string,
+  overrides: Partial<ReminderTemplateFields> = {}
+): Promise<string> {
+  const store = loadJsonStore<ReminderTemplateFields>(TEMPLATES_FILE);
+  const template = store[templateName];
+  if (!template) throw new Error(`Template not found: ${templateName}`);
+  return createReminder({ ...template, ...overrides });
+}
+
+// ─── Saved views (named filter presets) ────────────────────────────────────
+
+const SAVED_VIEWS_FILE = "reminder-saved-views.json";
+
+export async function saveReminderView(viewName: string, filter: ReminderFilter): Promise<void> {
+  const store = loadJsonStore<ReminderFilter>(SAVED_VIEWS_FILE);
+  store[viewName] = filter;
+  saveJsonStore(SAVED_VIEWS_FILE, store);
+}
+
+export async function listSavedReminderViews(): Promise<Array<{ name: string; filter: ReminderFilter }>> {
+  const store = loadJsonStore<ReminderFilter>(SAVED_VIEWS_FILE);
+  return Object.entries(store).map(([name, filter]) => ({ name, filter }));
+}
+
+export async function deleteSavedReminderView(viewName: string): Promise<boolean> {
+  const store = loadJsonStore<ReminderFilter>(SAVED_VIEWS_FILE);
+  if (!(viewName in store)) return false;
+  delete store[viewName];
+  saveJsonStore(SAVED_VIEWS_FILE, store);
+  return true;
+}
+
+export async function runSavedReminderView(viewName: string): Promise<Reminder[]> {
+  const store = loadJsonStore<ReminderFilter>(SAVED_VIEWS_FILE);
+  const filter = store[viewName];
+  if (!filter) throw new Error(`Saved view not found: ${viewName}`);
+  const result = await queryRemindersWhere(filter, false);
+  return Array.isArray(result) ? result : [];
 }

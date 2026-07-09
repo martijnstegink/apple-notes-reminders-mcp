@@ -224,10 +224,44 @@ export async function listFolders(): Promise<NoteFolder[]> {
 
 type NoteRowOut = Omit<Note, "body" | "attachments">;
 
-export async function listNotes(folderName?: string): Promise<{ results: NoteRowOut[] }> {
+export type NoteSort = "modified_desc" | "modified_asc" | "created_desc" | "created_asc" | "name_asc" | "name_desc";
+
+function sortNotes<T extends { modificationDate: string; creationDate: string; name: string }>(
+  rows: T[],
+  sort: NoteSort = "modified_desc"
+): T[] {
+  const sorted = [...rows];
+  switch (sort) {
+    case "modified_asc": sorted.sort((a, b) => a.modificationDate.localeCompare(b.modificationDate)); break;
+    case "created_desc": sorted.sort((a, b) => b.creationDate.localeCompare(a.creationDate)); break;
+    case "created_asc": sorted.sort((a, b) => a.creationDate.localeCompare(b.creationDate)); break;
+    case "name_asc": sorted.sort((a, b) => a.name.localeCompare(b.name)); break;
+    case "name_desc": sorted.sort((a, b) => b.name.localeCompare(a.name)); break;
+    case "modified_desc":
+    default: sorted.sort((a, b) => b.modificationDate.localeCompare(a.modificationDate));
+  }
+  return sorted;
+}
+
+function paginate<T>(rows: T[], limit?: number, offset?: number): T[] {
+  const start = offset ?? 0;
+  return limit != null ? rows.slice(start, start + limit) : rows.slice(start);
+}
+
+export interface ListOptions {
+  sort?: NoteSort;
+  limit?: number;
+  offset?: number;
+}
+
+export async function listNotes(
+  folderName?: string,
+  options: ListOptions = {}
+): Promise<{ results: NoteRowOut[]; total: number }> {
   const all = Store.readAllNotes(false);
   const filtered = folderName ? all.filter((n) => n.folder === folderName) : all;
-  return { results: filtered };
+  const sorted = sortNotes(filtered, options.sort);
+  return { results: paginate(sorted, options.limit, options.offset), total: sorted.length };
 }
 
 export async function getNote(identifier: string): Promise<Note | null> {
@@ -312,16 +346,20 @@ export async function getAttachment(id: string): Promise<Store.AttachmentInfo | 
 
 export async function getFolderWithBodies(
   folder?: string,
-  maxCharsPerBody?: number
-): Promise<Array<Store.NoteRow & { body: string; truncated: boolean }>> {
-  return Store.readFolderWithBodies(folder, maxCharsPerBody);
+  maxCharsPerBody?: number,
+  options: ListOptions = {}
+): Promise<{ results: Array<Store.NoteRow & { body: string; truncated: boolean }>; total: number }> {
+  const all = Store.readFolderWithBodies(folder, maxCharsPerBody);
+  const sorted = sortNotes(all, options.sort);
+  return { results: paginate(sorted, options.limit, options.offset), total: sorted.length };
 }
 
 export async function searchNotes(
   query: string,
   withBody = false,
-  maxChars?: number
-): Promise<{ results: (NoteRowOut | (NoteRowOut & { body: string; truncated: boolean }))[] }> {
+  maxChars?: number,
+  options: ListOptions = {}
+): Promise<{ results: (NoteRowOut | (NoteRowOut & { body: string; truncated: boolean }))[]; total: number }> {
   const q = query.toLowerCase();
   const all = Store.readAllNotesWithBody(); // one DB open for the whole search
   const ocrByNote = Store.readOcrTextByNote(); // fold recognized text from image attachments into the search corpus
@@ -330,18 +368,20 @@ export async function searchNotes(
     const ocr = zpk != null ? (ocrByNote.get(zpk) ?? "") : "";
     return `${n.name} ${n.body} ${ocr}`.toLowerCase().includes(q);
   });
+  const sorted = sortNotes(filtered, options.sort);
+  const page = paginate(sorted, options.limit, options.offset);
   if (withBody) {
     const limit = maxChars ?? 300;
-    const results = filtered.map(({ body, ...row }) => {
+    const results = page.map(({ body, ...row }) => {
       let b = body;
       let truncated = false;
       if (b.length > limit) { b = b.slice(0, limit); truncated = true; }
       return { ...row, body: b, truncated };
     });
-    return { results };
+    return { results, total: sorted.length };
   }
-  const results = filtered.map(({ body: _body, ...row }) => row);
-  return { results };
+  const results = page.map(({ body: _body, ...row }) => row);
+  return { results, total: sorted.length };
 }
 
 // Notes stores hashtags as literal "#word" text in the note body (Notes.app

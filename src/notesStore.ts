@@ -1,6 +1,6 @@
 import Database from "better-sqlite3";
 import { gunzipSync, inflateSync } from "zlib";
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from "fs";
+import { copyFileSync, existsSync, mkdtempSync, rmSync, statSync } from "fs";
 import { join } from "path";
 import { tmpdir, homedir } from "os";
 
@@ -197,9 +197,24 @@ function decodeNoteBody(data: Buffer): string {
   return applyTodoMarkers(text, noteTextMsg);
 }
 
+// Decoding is a gunzip + protobuf walk, not free on a large note — cache the
+// result keyed on (Z_PK, mod_date). mod_date changes whenever the note's
+// content changes, so a stale cache entry is naturally never served: an edit
+// produces a new key, not an invalidation race to get right.
+const decodedBodyCache = new Map<string, string>();
+
+function decodeNoteBodyCached(zpk: number, modDate: number | null, data: Buffer): string {
+  const key = `${zpk}:${modDate ?? 0}`;
+  const cached = decodedBodyCache.get(key);
+  if (cached !== undefined) return cached;
+  const body = decodeNoteBody(data);
+  decodedBodyCache.set(key, body);
+  return body;
+}
+
 // ── DB open helper ────────────────────────────────────────────────────────────
 
-function openDb(): { db: Database.Database; cleanup: () => void } {
+function openDbUncached(): { db: Database.Database; cleanup: () => void } {
   let tmpDir: string | null = null;
   let dbFile = DB_PATH;
 
@@ -252,6 +267,47 @@ function openDb(): { db: Database.Database; cleanup: () => void } {
     throw err;
   }
 }
+
+// ── DB connection + schema cache ────────────────────────────────────────────
+// Every call used to open a fresh connection (or copy the file, if locked)
+// and re-run detectSchema's several PRAGMA/COUNT queries from scratch — real
+// overhead on every single tool call. Cache both, keyed on the source file's
+// mtimes, so repeated calls between actual writes are free; any write to the
+// live NoteStore.sqlite (main file or WAL) changes the key and forces a fresh
+// open + schema re-detection, so this never serves stale data.
+interface DbCacheEntry {
+  db: Database.Database;
+  cleanup: () => void;
+  schema: SchemaInfo;
+  mtimeKey: string;
+}
+let dbCache: DbCacheEntry | null = null;
+
+function sourceMtimeKey(): string {
+  return ["", "-wal", "-shm"]
+    .map((ext) => {
+      try {
+        return String(statSync(DB_PATH + ext).mtimeMs);
+      } catch {
+        return "0";
+      }
+    })
+    .join("|");
+}
+
+function openDb(): { db: Database.Database; schema: SchemaInfo } {
+  const key = sourceMtimeKey();
+  if (dbCache && dbCache.mtimeKey === key) {
+    return { db: dbCache.db, schema: dbCache.schema };
+  }
+  if (dbCache) dbCache.cleanup();
+  const { db, cleanup } = openDbUncached();
+  const schema = detectSchema(db);
+  dbCache = { db, cleanup, schema, mtimeKey: key };
+  return { db, schema };
+}
+
+process.on("exit", () => dbCache?.cleanup());
 
 // ── Schema detection ──────────────────────────────────────────────────────────
 
@@ -474,9 +530,7 @@ function buildFolderId(zpk: number, storeUuid: string): string {
 }
 
 export function readFolders(): FolderRecord[] {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
 
     const parentCol = schema.colParent ? `${schema.colParent}` : "NULL";
     const accountCol = schema.colAccount ? `${schema.colAccount}` : "NULL";
@@ -545,9 +599,6 @@ export function readFolders(): FolderRecord[] {
           noteCount: count,
         };
       });
-  } finally {
-    cleanup();
-  }
 }
 
 interface RawNoteQueryResult {
@@ -636,9 +687,7 @@ function isRecentlyDeleted(r: RawNoteQueryResult, schema: SchemaInfo): boolean {
 // Recently Deleted notes are excluded everywhere else in this file (they're
 // filtered out via isRecentlyDeleted); this is the one reader that returns them.
 export function readRecentlyDeleted(): Array<NoteRow & { body: string }> {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const lockedCol = schema.colIsLockedNote ? `n.${schema.colIsLockedNote}` : "NULL";
     const pinnedCol = schema.colPinned ? `n.${schema.colPinned}` : "NULL";
     const rows = db
@@ -657,32 +706,22 @@ export function readRecentlyDeleted(): Array<NoteRow & { body: string }> {
       .filter((r) => isRecentlyDeleted(r, schema))
       .map((r) => {
         const base = rowToNoteRow(r, schema);
-        const body = r.is_locked ? "[locked]" : r.ZDATA ? decodeNoteBody(r.ZDATA) : "";
+        const body = r.is_locked ? "[locked]" : r.ZDATA ? decodeNoteBodyCached(r.Z_PK, r.mod_date, r.ZDATA) : "";
         return { ...base, body };
       });
-  } finally {
-    cleanup();
-  }
 }
 
 export function readAllNotes(withBody: boolean): NoteRow[] {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const sql = buildNoteQuery(schema, withBody);
     const rows = db.prepare(sql).all() as RawNoteQueryResult[];
     return rows
       .filter((r) => !isRecentlyDeleted(r, schema))
       .map((r) => rowToNoteRow(r, schema));
-  } finally {
-    cleanup();
-  }
 }
 
 export function readAllNotesWithBody(): Array<NoteRow & { body: string }> {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const sql = buildNoteQuery(schema, true);
     const rows = db.prepare(sql).all() as RawNoteQueryResult[];
     return rows
@@ -693,22 +732,17 @@ export function readAllNotesWithBody(): Array<NoteRow & { body: string }> {
         if (r.is_locked) {
           body = "[locked]";
         } else if (r.ZDATA) {
-          body = decodeNoteBody(r.ZDATA);
+          body = decodeNoteBodyCached(r.Z_PK, r.mod_date, r.ZDATA);
         }
         return { ...base, body };
       });
-  } finally {
-    cleanup();
-  }
 }
 
 export function readFolderWithBodies(
   folder?: string,
   maxCharsPerBody?: number
 ): Array<NoteRow & { body: string; truncated: boolean }> {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const sql = buildNoteQuery(schema, true);
     const rows = db.prepare(sql).all() as RawNoteQueryResult[];
     return rows
@@ -720,7 +754,7 @@ export function readFolderWithBodies(
         if (r.is_locked) {
           body = "[locked]";
         } else if (r.ZDATA) {
-          body = decodeNoteBody(r.ZDATA);
+          body = decodeNoteBodyCached(r.Z_PK, r.mod_date, r.ZDATA);
         }
         let truncated = false;
         if (maxCharsPerBody != null && body.length > maxCharsPerBody) {
@@ -729,9 +763,6 @@ export function readFolderWithBodies(
         }
         return { ...base, body, truncated };
       });
-  } finally {
-    cleanup();
-  }
 }
 
 // Attachment media files live at:
@@ -785,9 +816,7 @@ function rowToAttachmentInfo(r: RawAttachmentRow, schema: SchemaInfo, accountPk:
 // Bulk OCR text per note (one attachment scan, not one query per note) — used
 // to fold image-recognized text into the searchable corpus for notes_search.
 export function readOcrTextByNote(): Map<number, string> {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const map = new Map<number, string>();
     if (schema.entAttachment == null) return map;
     const deletedFilter = schema.colDeleted
@@ -805,15 +834,10 @@ export function readOcrTextByNote(): Map<number, string> {
       map.set(r.note_pk, prev ? `${prev} ${r.ocr}` : r.ocr);
     }
     return map;
-  } finally {
-    cleanup();
-  }
 }
 
 export function readAttachments(noteZpk: number): AttachmentInfo[] {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     if (schema.entAttachment == null) return [];
 
     const noteRow = db
@@ -845,18 +869,13 @@ export function readAttachments(noteZpk: number): AttachmentInfo[] {
       .all(schema.entAttachment, noteZpk) as RawAttachmentRow[];
 
     return rows.map((r) => rowToAttachmentInfo(r, schema, accountPk));
-  } finally {
-    cleanup();
-  }
 }
 
 // Looks up one attachment by its media identifier (preferred — what
 // readAttachments returns as `id`) or its own attachment identifier, across
 // every note, since notes_get_attachment only receives the id.
 export function readAttachmentByIdentifier(identifier: string): AttachmentInfo | null {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     if (schema.entAttachment == null) return null;
 
     const noteFolderCol = schema.colFolder;
@@ -889,17 +908,12 @@ export function readAttachmentByIdentifier(identifier: string): AttachmentInfo |
     }
 
     return rowToAttachmentInfo(row, schema, accountPk);
-  } finally {
-    cleanup();
-  }
 }
 
 export function readNoteById(zpk: number): (NoteRow & { body: string }) | null;
 export function readNoteById(zpk: number, withBody: true): (NoteRow & { body: string }) | null;
 export function readNoteById(zpk: number, withBody = true): (NoteRow & { body: string }) | null {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const lockedCol = schema.colIsLockedNote ? `n.${schema.colIsLockedNote}` : "NULL";
     const pinnedCol = schema.colPinned ? `n.${schema.colPinned}` : "NULL";
     const row = db
@@ -921,18 +935,13 @@ export function readNoteById(zpk: number, withBody = true): (NoteRow & { body: s
     if (row.is_locked) {
       body = "[locked]";
     } else if (withBody && row.ZDATA) {
-      body = decodeNoteBody(row.ZDATA);
+      body = decodeNoteBodyCached(row.Z_PK, row.mod_date, row.ZDATA);
     }
     return { ...base, body };
-  } finally {
-    cleanup();
-  }
 }
 
 export function readNoteByTitle(title: string): (NoteRow & { body: string }) | null {
-  const { db, cleanup } = openDb();
-  try {
-    const schema = detectSchema(db);
+  const { db, schema } = openDb();
     const lockedCol = schema.colIsLockedNote ? `n.${schema.colIsLockedNote}` : "NULL";
     const pinnedCol = schema.colPinned ? `n.${schema.colPinned}` : "NULL";
     const row = db
@@ -955,10 +964,7 @@ export function readNoteByTitle(title: string): (NoteRow & { body: string }) | n
     if (row.is_locked) {
       body = "[locked]";
     } else if (row.ZDATA) {
-      body = decodeNoteBody(row.ZDATA);
+      body = decodeNoteBodyCached(row.Z_PK, row.mod_date, row.ZDATA);
     }
     return { ...base, body };
-  } finally {
-    cleanup();
-  }
 }

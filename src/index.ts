@@ -14,13 +14,20 @@ server.tool("notes_list_folders", "List all folders in Apple Notes", {}, async (
   content: [{ type: "text", text: JSON.stringify(await Notes.listFolders(), null, 2) }],
 }));
 
+const noteSortShape = {
+  sort: z.enum(["modified_desc", "modified_asc", "created_desc", "created_asc", "name_asc", "name_desc"])
+    .optional().describe("Sort order (default modified_desc)"),
+  limit: z.number().int().positive().optional().describe("Max results to return"),
+  offset: z.number().int().nonnegative().optional().describe("Number of results to skip (for paging)"),
+};
+
 server.tool(
   "notes_list",
-  "List notes, optionally filtered by folder",
-  { folder: z.string().optional().describe("Folder name to filter by") },
-  async ({ folder }) => {
-    const { results } = await Notes.listNotes(folder);
-    const text = results.length ? JSON.stringify(results, null, 2) : "No notes found.";
+  "List notes, optionally filtered by folder. Results include a `total` count ahead of any limit/offset paging.",
+  { folder: z.string().optional().describe("Folder name to filter by"), ...noteSortShape },
+  async ({ folder, sort, limit, offset }) => {
+    const { results, total } = await Notes.listNotes(folder, { sort, limit, offset });
+    const text = results.length ? JSON.stringify({ total, results }, null, 2) : "No notes found.";
     return { content: [{ type: "text", text }] };
   }
 );
@@ -85,11 +92,12 @@ server.tool(
     max_chars: z.number().int().positive().optional().describe(
       "Max body characters per note. Bodies longer than this are truncated and marked truncated=true."
     ),
+    ...noteSortShape,
   },
-  async ({ folder, max_chars }) => {
-    const results = await Notes.getFolderWithBodies(folder, max_chars);
+  async ({ folder, max_chars, sort, limit, offset }) => {
+    const { results, total } = await Notes.getFolderWithBodies(folder, max_chars, { sort, limit, offset });
     const text = results.length
-      ? JSON.stringify(results, null, 2)
+      ? JSON.stringify({ total, results }, null, 2)
       : folder ? `No notes found in folder "${folder}".` : "No notes found.";
     return { content: [{ type: "text", text }] };
   }
@@ -113,10 +121,11 @@ server.tool(
       "Max body characters per result when with_body=true (default 300). " +
       "Bodies longer than this are truncated and marked truncated=true."
     ),
+    ...noteSortShape,
   },
-  async ({ query, with_body, max_chars }) => {
-    const { results } = await Notes.searchNotes(query, with_body ?? false, max_chars);
-    const text = results.length ? JSON.stringify(results, null, 2) : "No results.";
+  async ({ query, with_body, max_chars, sort, limit, offset }) => {
+    const { results, total } = await Notes.searchNotes(query, with_body ?? false, max_chars, { sort, limit, offset });
+    const text = results.length ? JSON.stringify({ total, results }, null, 2) : "No results.";
     return { content: [{ type: "text", text }] };
   }
 );
@@ -255,14 +264,21 @@ server.tool("reminders_list_lists", "List all reminder lists", {}, async () => (
 
 server.tool(
   "reminders_list",
-  "List reminders, optionally filtered by list",
+  "List reminders, optionally filtered by list. Results include a `total` count ahead of any limit/offset paging.",
   {
     list: z.string().optional().describe("List name to filter by"),
     include_completed: z.boolean().optional().describe("Include completed reminders (default false)"),
+    sort: z.enum(["modified_desc", "modified_asc", "due_asc", "due_desc", "name_asc", "name_desc"])
+      .optional().describe("Sort order (default modified_desc)"),
+    limit: z.number().int().positive().optional().describe("Max results to return"),
+    offset: z.number().int().nonnegative().optional().describe("Number of results to skip (for paging)"),
   },
-  async ({ list, include_completed }) => {
-    const r = await Reminders.listReminders({ listName: list, includeCompleted: include_completed ?? false });
-    return { content: [{ type: "text", text: r.length ? JSON.stringify(r, null, 2) : "No reminders found." }] };
+  async ({ list, include_completed, sort, limit, offset }) => {
+    const { results, total } = await Reminders.listReminders({
+      listName: list, includeCompleted: include_completed ?? false, sort, limit, offset,
+    });
+    const text = results.length ? JSON.stringify({ total, results }, null, 2) : "No reminders found.";
+    return { content: [{ type: "text", text }] };
   }
 );
 
@@ -579,6 +595,146 @@ server.tool(
     }
     const suffix = r.failed > 0 ? ` (${r.failed} failed)` : "";
     return { content: [{ type: "text", text: `Moved ${r.moved}/${r.total} reminder(s) to "${destination_list}".${suffix}` }] };
+  }
+);
+
+// ─── Reminders: templates + saved views ───────────────────────────────────────
+// Server-side emulation — EventKit has no template/named-filter concept of its
+// own, so these are just JSON files under ~/.apple-notes-reminders-mcp/.
+
+const templateFieldsShape = {
+  name: z.string().describe("Reminder name"),
+  body: z.string().optional().describe("Notes / description"),
+  list: z.string().optional().describe("List name"),
+  due_date: z.string().optional().describe("Due date in natural language"),
+  priority: z.number().min(0).max(9).optional().describe("Priority: 0=none, 1=high, 5=medium, 9=low"),
+  url: z.string().optional().describe("URL to attach"),
+  flagged: z.boolean().optional().describe("Mark as flagged"),
+  recurrence: recurrenceShape.optional(),
+  early_reminders: z.array(z.number().int().positive()).optional().describe("Minutes before the due date to also alert"),
+  location_alarm: locationAlarmShape.optional(),
+};
+
+// Omits undefined keys entirely (rather than mapping them to explicit
+// `undefined` values), so that spreading this over a saved template in
+// createReminderFromTemplate only overrides fields the caller actually passed.
+const toTemplateFields = (a: {
+  name?: string; body?: string; list?: string; due_date?: string; priority?: number; url?: string;
+  flagged?: boolean; recurrence?: any; early_reminders?: number[]; location_alarm?: any;
+}): Partial<Reminders.ReminderTemplateFields> => {
+  const out: Partial<Reminders.ReminderTemplateFields> = {};
+  if (a.name !== undefined) out.name = a.name;
+  if (a.body !== undefined) out.body = a.body;
+  if (a.list !== undefined) out.listName = a.list;
+  if (a.due_date !== undefined) out.dueDateInput = a.due_date;
+  if (a.priority !== undefined) out.priority = a.priority;
+  if (a.url !== undefined) out.url = a.url;
+  if (a.flagged !== undefined) out.flagged = a.flagged;
+  if (a.recurrence !== undefined) out.recurrence = a.recurrence;
+  if (a.early_reminders !== undefined) out.earlyAlarmMinutes = a.early_reminders;
+  if (a.location_alarm !== undefined) out.locationAlarm = a.location_alarm;
+  return out;
+};
+
+server.tool(
+  "reminders_save_template",
+  "Save a named reminder template (all reminders_create fields) for later reuse with reminders_create_from_template.",
+  { template_name: z.string().describe("Name to save the template under"), ...templateFieldsShape },
+  async ({ template_name, ...fields }) => {
+    // templateFieldsShape requires `name`, so this is always fully populated.
+    await Reminders.saveReminderTemplate(template_name, toTemplateFields(fields) as Reminders.ReminderTemplateFields);
+    return { content: [{ type: "text", text: `Template "${template_name}" saved.` }] };
+  }
+);
+
+server.tool(
+  "reminders_list_templates",
+  "List saved reminder templates",
+  {},
+  async () => {
+    const templates = await Reminders.listReminderTemplates();
+    return { content: [{ type: "text", text: templates.length ? JSON.stringify(templates, null, 2) : "No saved templates." }] };
+  }
+);
+
+server.tool(
+  "reminders_delete_template",
+  "Delete a saved reminder template",
+  { template_name: z.string().describe("Template name") },
+  async ({ template_name }) => {
+    const deleted = await Reminders.deleteReminderTemplate(template_name);
+    return { content: [{ type: "text", text: deleted ? `Template "${template_name}" deleted.` : `Template not found: ${template_name}` }], isError: !deleted };
+  }
+);
+
+const templateOverridesShape = {
+  name: z.string().optional().describe("Override the template's name"),
+  body: z.string().optional().describe("Override the template's notes / description"),
+  list: z.string().optional().describe("Override the template's list"),
+  due_date: z.string().optional().describe("Override the template's due date (natural language)"),
+  priority: z.number().min(0).max(9).optional().describe("Override the template's priority"),
+  url: z.string().optional().describe("Override the template's URL"),
+  flagged: z.boolean().optional().describe("Override the template's flagged state"),
+  recurrence: recurrenceShape.optional().describe("Override the template's recurrence"),
+  early_reminders: z.array(z.number().int().positive()).optional().describe("Override the template's early alerts"),
+  location_alarm: locationAlarmShape.optional().describe("Override the template's location alert"),
+};
+
+server.tool(
+  "reminders_create_from_template",
+  "Create a reminder from a saved template. Any field passed here overrides the template's value for this creation only (e.g. supply a fresh due_date each time).",
+  { template_name: z.string().describe("Template name"), ...templateOverridesShape },
+  async ({ template_name, ...overrides }) => {
+    try {
+      const id = await Reminders.createReminderFromTemplate(template_name, toTemplateFields(overrides));
+      return { content: [{ type: "text", text: `Created (${id}) from template "${template_name}".` }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: String(err) }], isError: true };
+    }
+  }
+);
+
+server.tool(
+  "reminders_save_view",
+  "Save a named word-based filter (same shape as reminders_query_where) for later reuse with reminders_run_view.",
+  { view_name: z.string().describe("Name to save the view under"), ...reminderFilterShape },
+  async ({ view_name, ...filter }) => {
+    await Reminders.saveReminderView(view_name, toReminderFilter(filter));
+    return { content: [{ type: "text", text: `View "${view_name}" saved.` }] };
+  }
+);
+
+server.tool(
+  "reminders_list_views",
+  "List saved reminder filter views",
+  {},
+  async () => {
+    const views = await Reminders.listSavedReminderViews();
+    return { content: [{ type: "text", text: views.length ? JSON.stringify(views, null, 2) : "No saved views." }] };
+  }
+);
+
+server.tool(
+  "reminders_delete_view",
+  "Delete a saved reminder filter view",
+  { view_name: z.string().describe("View name") },
+  async ({ view_name }) => {
+    const deleted = await Reminders.deleteSavedReminderView(view_name);
+    return { content: [{ type: "text", text: deleted ? `View "${view_name}" deleted.` : `View not found: ${view_name}` }], isError: !deleted };
+  }
+);
+
+server.tool(
+  "reminders_run_view",
+  "Run a saved reminder filter view and return matching reminders",
+  { view_name: z.string().describe("View name") },
+  async ({ view_name }) => {
+    try {
+      const r = await Reminders.runSavedReminderView(view_name);
+      return { content: [{ type: "text", text: r.length ? JSON.stringify(r, null, 2) : "No reminders match." }] };
+    } catch (err) {
+      return { content: [{ type: "text", text: String(err) }], isError: true };
+    }
   }
 );
 

@@ -70,6 +70,7 @@ func reminderToDict(_ r: EKReminder) -> [String: Any] {
         "dueDate": r.dueDateComponents?.date.map { iso.string(from: $0) } ?? "",
         "completionDate": r.completionDate.map { iso.string(from: $0) } ?? "",
         "isRecurring": !(r.recurrenceRules?.isEmpty ?? true),
+        "modifiedDate": r.lastModifiedDate.map { iso.string(from: $0) } ?? "",
     ]
     if let rule = r.recurrenceRules?.first {
         let freqStr: String
