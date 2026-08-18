@@ -24,4 +24,3 @@ __MACOSX/
 swift/**/.build/
 *.o
 swift/reminders-daemon
-.claude/settings.json
