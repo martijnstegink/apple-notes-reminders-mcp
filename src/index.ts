@@ -8,9 +8,15 @@ import * as Reminders from "./reminders.js";
 
 const server = new McpServer({ name: "apple-notes-reminders-mcp", version: "1.0.0" });
 
+const READ_ONLY = { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const CREATE = { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false };
+const MUTATE = { readOnlyHint: false, destructiveHint: false, idempotentHint: true, openWorldHint: false };
+const DESTRUCTIVE = { readOnlyHint: false, destructiveHint: true, idempotentHint: true, openWorldHint: false };
+const DESTRUCTIVE_MUTATE = { readOnlyHint: false, destructiveHint: true, idempotentHint: false, openWorldHint: false };
+
 // ─── Notes ────────────────────────────────────────────────────────────
 
-server.tool("notes_list_folders", "List all folders in Apple Notes", {}, async () => ({
+server.tool("notes_list_folders", "List all folders in Apple Notes", {}, READ_ONLY, async () => ({
   content: [{ type: "text", text: JSON.stringify(await Notes.listFolders(), null, 2) }],
 }));
 
@@ -25,6 +31,7 @@ server.tool(
   "notes_list",
   "List notes, optionally filtered by folder. Results include a `total` count ahead of any limit/offset paging.",
   { folder: z.string().optional().describe("Folder name to filter by"), ...noteSortShape },
+  READ_ONLY,
   async ({ folder, sort, limit, offset }) => {
     const { results, total } = await Notes.listNotes(folder, { sort, limit, offset });
     const text = results.length ? JSON.stringify({ total, results }, null, 2) : "No notes found.";
@@ -37,6 +44,7 @@ server.tool(
   "Get a note by name or ID. `attachments` lists each attachment's id, filename, type, and any recognized " +
   "OCR text (for images with text in them) — pass an attachment's id to notes_get_attachment to fetch the image itself.",
   { identifier: z.string().describe("Note name or ID") },
+  READ_ONLY,
   async ({ identifier }) => {
     const note = await Notes.getNote(identifier);
     return note
@@ -61,6 +69,7 @@ server.tool(
   "Fetch an image attachment's content as an MCP image block, given the attachment id from notes_get's `attachments` list. " +
   "Only image types are supported (jpeg/png/gif/webp/heic/svg) — other attachment types (PDF, embedded tables, etc.) return their metadata as text instead.",
   { id: z.string().describe("Attachment id (from notes_get's attachments[].id)") },
+  READ_ONLY,
   async ({ id }) => {
     const att = await Notes.getAttachment(id);
     if (!att) return { content: [{ type: "text", text: `Attachment not found: ${id}` }], isError: true };
@@ -94,6 +103,7 @@ server.tool(
     ),
     ...noteSortShape,
   },
+  READ_ONLY,
   async ({ folder, max_chars, sort, limit, offset }) => {
     const { results, total } = await Notes.getFolderWithBodies(folder, max_chars, { sort, limit, offset });
     const text = results.length
@@ -123,6 +133,7 @@ server.tool(
     ),
     ...noteSortShape,
   },
+  READ_ONLY,
   async ({ query, with_body, max_chars, sort, limit, offset }) => {
     const { results, total } = await Notes.searchNotes(query, with_body ?? false, max_chars, { sort, limit, offset });
     const text = results.length ? JSON.stringify({ total, results }, null, 2) : "No results.";
@@ -145,6 +156,7 @@ server.tool(
     folder: z.string().optional().describe("Folder name"),
     format: noteBodyFormat,
   },
+  CREATE,
   async ({ name, body, folder, format }) => ({
     content: [{ type: "text", text: `Note created: ${await Notes.createNote(name, body, folder, format)}` }],
   })
@@ -165,6 +177,7 @@ server.tool(
     mode: z.enum(["replace", "append", "prepend"]).optional().describe("How a new body combines with the existing one (default replace)"),
     force: z.boolean().optional().describe("Set true to replace the body of a note that has attachments"),
   },
+  DESTRUCTIVE_MUTATE,
   async ({ identifier, name, body, folder, format, mode, force }) => {
     const result = await Notes.updateNote(identifier, { name, body, folderName: folder, format, mode, force });
     if (!result.applied) {
@@ -178,6 +191,7 @@ server.tool(
   "notes_delete",
   "Delete a note",
   { identifier: z.string().describe("Note name or ID") },
+  DESTRUCTIVE,
   async ({ identifier }) => {
     await Notes.deleteNote(identifier);
     return { content: [{ type: "text", text: "Note deleted." }] };
@@ -188,6 +202,7 @@ server.tool(
   "notes_create_folder",
   "Create a new folder in Apple Notes",
   { name: z.string().describe("Folder name") },
+  CREATE,
   async ({ name }) => ({
     content: [{ type: "text", text: `Folder created: ${await Notes.createFolder(name)}` }],
   })
@@ -197,6 +212,7 @@ server.tool(
   "notes_rename_folder",
   "Rename a folder. For a nested folder use its full path from notes_list_folders (e.g. \"Recipes/Desserts\"); a plain name matches a top-level folder.",
   { identifier: z.string().describe("Folder name, or \"/\"-separated path for a nested folder"), new_name: z.string().describe("New folder name") },
+  MUTATE,
   async ({ identifier, new_name }) => {
     await Notes.renameFolder(identifier, new_name);
     return { content: [{ type: "text", text: `Folder renamed to "${new_name}".` }] };
@@ -207,6 +223,7 @@ server.tool(
   "notes_delete_folder",
   "Delete a folder. Its notes move to Recently Deleted, same as deleting them individually (not permanent).",
   { identifier: z.string().describe("Folder name, or \"/\"-separated path for a nested folder") },
+  DESTRUCTIVE,
   async ({ identifier }) => {
     await Notes.deleteFolder(identifier);
     return { content: [{ type: "text", text: "Folder deleted." }] };
@@ -217,6 +234,7 @@ server.tool(
   "notes_list_tags",
   "List all #hashtags used across notes, with how many notes carry each. Tags are literal '#word' text Notes.app auto-links — read-only.",
   {},
+  READ_ONLY,
   async () => {
     const tags = await Notes.listTags();
     return { content: [{ type: "text", text: tags.length ? JSON.stringify(tags, null, 2) : "No tags found." }] };
@@ -227,6 +245,7 @@ server.tool(
   "notes_recently_deleted",
   "List notes currently in Recently Deleted",
   {},
+  READ_ONLY,
   async () => {
     const results = await Notes.listRecentlyDeleted();
     return { content: [{ type: "text", text: results.length ? JSON.stringify(results, null, 2) : "Recently Deleted is empty." }] };
@@ -240,6 +259,7 @@ server.tool(
     identifier: z.string().describe("Note id (from notes_recently_deleted)"),
     destination_folder: z.string().optional().describe("Folder to restore into (default: \"Notes\")"),
   },
+  MUTATE,
   async ({ identifier, destination_folder }) => {
     await Notes.restoreNote(identifier, destination_folder);
     return { content: [{ type: "text", text: `Note restored to "${destination_folder ?? "Notes"}".` }] };
@@ -250,6 +270,7 @@ server.tool(
   "notes_move",
   "Move a note to a different folder",
   { identifier: z.string().describe("Note name or ID"), folder: z.string().describe("Destination folder") },
+  MUTATE,
   async ({ identifier, folder }) => {
     await Notes.moveNote(identifier, folder);
     return { content: [{ type: "text", text: "Note moved." }] };
@@ -258,7 +279,7 @@ server.tool(
 
 // ─── Reminders (EventKit) ─────────────────────────────────────────────
 
-server.tool("reminders_list_lists", "List all reminder lists", {}, async () => ({
+server.tool("reminders_list_lists", "List all reminder lists", {}, READ_ONLY, async () => ({
   content: [{ type: "text", text: JSON.stringify(await Reminders.listReminderLists(), null, 2) }],
 }));
 
@@ -273,6 +294,7 @@ server.tool(
     limit: z.number().int().positive().optional().describe("Max results to return"),
     offset: z.number().int().nonnegative().optional().describe("Number of results to skip (for paging)"),
   },
+  READ_ONLY,
   async ({ list, include_completed, sort, limit, offset }) => {
     const { results, total } = await Reminders.listReminders({
       listName: list, includeCompleted: include_completed ?? false, sort, limit, offset,
@@ -286,6 +308,7 @@ server.tool(
   "reminders_get",
   "Get a reminder by name or ID",
   { identifier: z.string().describe("Reminder name or ID") },
+  READ_ONLY,
   async ({ identifier }) => {
     const r = await Reminders.getReminder(identifier);
     return r
@@ -298,6 +321,7 @@ server.tool(
   "reminders_search",
   "Search reminders by name, notes, or list",
   { query: z.string().describe("Search query") },
+  READ_ONLY,
   async ({ query }) => {
     const r = await Reminders.searchReminders(query);
     return { content: [{ type: "text", text: r.length ? JSON.stringify(r, null, 2) : "No results." }] };
@@ -327,6 +351,7 @@ server.tool(
     view: z.enum(["today", "planned", "overdue", "urgent", "flagged", "completed"]).describe("Which smart list to fetch"),
     list: z.string().optional().describe("Restrict to this list (omit for all lists)"),
   },
+  READ_ONLY,
   async ({ view, list }) => {
     const r = await Reminders.viewReminders(view, list);
     return { content: [{ type: "text", text: r.length ? JSON.stringify(r, null, 2) : "No reminders found." }] };
@@ -350,6 +375,7 @@ server.tool(
     ),
     location_alarm: locationAlarmShape.optional(),
   },
+  CREATE,
   async ({ name, body, list, due_date, priority, url, flagged, recurrence, early_reminders, location_alarm }) => {
     const id = await Reminders.createReminder({
       name, body, listName: list, dueDateInput: due_date, priority, url, flagged,
@@ -377,6 +403,7 @@ server.tool(
       url: z.string().optional().describe("URL to attach"),
     })).min(1).describe("Reminders to create"),
   },
+  CREATE,
   async ({ list, items }) => {
     const result = await Reminders.createRemindersBatch(items, list);
     const lines = [`Created ${result.created}/${items.length} reminder(s) in "${list}".`];
@@ -406,6 +433,7 @@ server.tool(
     ),
     location_alarm: locationAlarmShape.optional().describe("Adds a location-based alert (additive — existing alerts are kept)"),
   },
+  DESTRUCTIVE,
   async ({ identifier, name, body, due_date, priority, url, list, flagged, recurrence, early_reminders, location_alarm }) => {
     await Reminders.updateReminder(identifier, {
       name, body, dueDateInput: due_date, priority, url, listName: list, flagged,
@@ -422,6 +450,7 @@ server.tool(
     identifier: z.string().describe("Reminder name or ID"),
     completed: z.boolean().describe("true = complete, false = incomplete"),
   },
+  MUTATE,
   async ({ identifier, completed }) => {
     await Reminders.completeReminder(identifier, completed);
     return { content: [{ type: "text", text: `Marked as ${completed ? "completed" : "incomplete"}.` }] };
@@ -432,6 +461,7 @@ server.tool(
   "reminders_delete",
   "Delete a reminder",
   { identifier: z.string().describe("Reminder name or ID") },
+  DESTRUCTIVE,
   async ({ identifier }) => {
     await Reminders.deleteReminder(identifier);
     return { content: [{ type: "text", text: "Reminder deleted." }] };
@@ -442,6 +472,7 @@ server.tool(
   "reminders_create_list",
   "Create a new reminder list",
   { name: z.string().describe("List name") },
+  CREATE,
   async ({ name }) => ({
     content: [{ type: "text", text: `List created: ${await Reminders.createReminderList(name)}` }],
   })
@@ -451,6 +482,7 @@ server.tool(
   "reminders_rename_list",
   "Rename a reminder list",
   { name: z.string().describe("Current list name"), new_name: z.string().describe("New list name") },
+  MUTATE,
   async ({ name, new_name }) => {
     await Reminders.renameReminderList(name, new_name);
     return { content: [{ type: "text", text: `List renamed to "${new_name}".` }] };
@@ -461,6 +493,7 @@ server.tool(
   "reminders_delete_list",
   "Delete a reminder list and all its reminders",
   { name: z.string().describe("List name") },
+  DESTRUCTIVE,
   async ({ name }) => {
     await Reminders.deleteReminderList(name);
     return { content: [{ type: "text", text: "List deleted." }] };
@@ -474,6 +507,7 @@ server.tool(
     parent: z.string().describe("Parent reminder name or ID"),
     name: z.string().describe("Subtask name"),
   },
+  CREATE,
   async ({ parent, name }) => ({
     content: [{ type: "text", text: `Subtask created: ${await Reminders.addSubtask(parent, name)}` }],
   })
@@ -487,6 +521,7 @@ server.tool(
     subtask: z.string().describe("Subtask name or ID"),
     completed: z.boolean().describe("true = complete, false = incomplete"),
   },
+  MUTATE,
   async ({ parent, subtask, completed }) => {
     await Reminders.completeSubtask(parent, subtask, completed);
     return { content: [{ type: "text", text: `Subtask ${completed ? "completed" : "restored"}.` }] };
@@ -497,6 +532,7 @@ server.tool(
   "reminders_delete_completed",
   "Delete all completed reminders. Optionally scoped to one list. Filtering and deletion happen server-side — no need to fetch or pass individual IDs.",
   { list: z.string().optional().describe("List name to scope deletion to (omit to delete across all lists)") },
+  DESTRUCTIVE,
   async ({ list }) => {
     const result = await Reminders.deleteCompletedReminders(list);
     const scope = list ? `from "${list}"` : "across all lists";
@@ -541,6 +577,7 @@ server.tool(
   "reminders_query_where",
   "Count or list reminders matching a word-based filter (list, completed, search text, due-date range, priority, has-due-date). Use count_only to preview how many a filter matches before a bulk action.",
   { ...reminderFilterShape, count_only: z.boolean().optional().describe("Return only the match count instead of full reminders (default false)") },
+  READ_ONLY,
   async ({ count_only, ...filter }) => {
     const result = await Reminders.queryRemindersWhere(toReminderFilter(filter), count_only ?? false);
     return { content: [{ type: "text", text: JSON.stringify(result, null, 2) }] };
@@ -551,6 +588,7 @@ server.tool(
   "reminders_delete_where",
   "Delete all reminders matching a word-based filter. SAFETY: without confirm=true, returns only the match count and deletes nothing — call again with confirm=true to delete.",
   { ...reminderFilterShape, confirm: z.boolean().optional().describe("Set true to actually delete; otherwise returns the count only") },
+  DESTRUCTIVE,
   async ({ confirm, ...filter }) => {
     const r = await Reminders.deleteRemindersWhere(toReminderFilter(filter), confirm ?? false);
     if (!("confirmed" in r) || r.confirmed === false) {
@@ -569,6 +607,7 @@ server.tool(
     set_completed: z.boolean().optional().describe("true = mark completed (default), false = mark incomplete"),
     confirm: z.boolean().optional().describe("Set true to actually apply; otherwise returns the count only"),
   },
+  MUTATE,
   async ({ set_completed, confirm, ...filter }) => {
     const target = set_completed ?? true;
     const r = await Reminders.completeRemindersWhere(toReminderFilter(filter), target, confirm ?? false);
@@ -588,6 +627,7 @@ server.tool(
     destination_list: z.string().describe("Name of the list to move matching reminders into"),
     confirm: z.boolean().optional().describe("Set true to actually move; otherwise returns the count only"),
   },
+  MUTATE,
   async ({ destination_list, confirm, ...filter }) => {
     const r = await Reminders.moveRemindersWhere(toReminderFilter(filter), destination_list, confirm ?? false);
     if (!("confirmed" in r) || r.confirmed === false) {
@@ -640,6 +680,7 @@ server.tool(
   "reminders_save_template",
   "Save a named reminder template (all reminders_create fields) for later reuse with reminders_create_from_template.",
   { template_name: z.string().describe("Name to save the template under"), ...templateFieldsShape },
+  MUTATE,
   async ({ template_name, ...fields }) => {
     // templateFieldsShape requires `name`, so this is always fully populated.
     await Reminders.saveReminderTemplate(template_name, toTemplateFields(fields) as Reminders.ReminderTemplateFields);
@@ -651,6 +692,7 @@ server.tool(
   "reminders_list_templates",
   "List saved reminder templates",
   {},
+  READ_ONLY,
   async () => {
     const templates = await Reminders.listReminderTemplates();
     return { content: [{ type: "text", text: templates.length ? JSON.stringify(templates, null, 2) : "No saved templates." }] };
@@ -661,6 +703,7 @@ server.tool(
   "reminders_delete_template",
   "Delete a saved reminder template",
   { template_name: z.string().describe("Template name") },
+  DESTRUCTIVE,
   async ({ template_name }) => {
     const deleted = await Reminders.deleteReminderTemplate(template_name);
     return { content: [{ type: "text", text: deleted ? `Template "${template_name}" deleted.` : `Template not found: ${template_name}` }], isError: !deleted };
@@ -684,6 +727,7 @@ server.tool(
   "reminders_create_from_template",
   "Create a reminder from a saved template. Any field passed here overrides the template's value for this creation only (e.g. supply a fresh due_date each time).",
   { template_name: z.string().describe("Template name"), ...templateOverridesShape },
+  CREATE,
   async ({ template_name, ...overrides }) => {
     try {
       const id = await Reminders.createReminderFromTemplate(template_name, toTemplateFields(overrides));
@@ -698,6 +742,7 @@ server.tool(
   "reminders_save_view",
   "Save a named word-based filter (same shape as reminders_query_where) for later reuse with reminders_run_view.",
   { view_name: z.string().describe("Name to save the view under"), ...reminderFilterShape },
+  MUTATE,
   async ({ view_name, ...filter }) => {
     await Reminders.saveReminderView(view_name, toReminderFilter(filter));
     return { content: [{ type: "text", text: `View "${view_name}" saved.` }] };
@@ -708,6 +753,7 @@ server.tool(
   "reminders_list_views",
   "List saved reminder filter views",
   {},
+  READ_ONLY,
   async () => {
     const views = await Reminders.listSavedReminderViews();
     return { content: [{ type: "text", text: views.length ? JSON.stringify(views, null, 2) : "No saved views." }] };
@@ -718,6 +764,7 @@ server.tool(
   "reminders_delete_view",
   "Delete a saved reminder filter view",
   { view_name: z.string().describe("View name") },
+  DESTRUCTIVE,
   async ({ view_name }) => {
     const deleted = await Reminders.deleteSavedReminderView(view_name);
     return { content: [{ type: "text", text: deleted ? `View "${view_name}" deleted.` : `View not found: ${view_name}` }], isError: !deleted };
@@ -728,6 +775,7 @@ server.tool(
   "reminders_run_view",
   "Run a saved reminder filter view and return matching reminders",
   { view_name: z.string().describe("View name") },
+  READ_ONLY,
   async ({ view_name }) => {
     try {
       const r = await Reminders.runSavedReminderView(view_name);
@@ -750,6 +798,7 @@ server.tool(
   "notes_query_where",
   "Count or list notes matching a word-based filter (folder, search text, tag). Use count_only to preview how many a filter matches before a bulk action.",
   { ...noteFilterShape, count_only: z.boolean().optional().describe("Return only the match count instead of full notes (default false)") },
+  READ_ONLY,
   async ({ folder, search, tag, count_only }) => {
     const result = await Notes.queryNotesWhere({ folder, search, tag }, count_only ?? false);
     if ("count" in result) {
@@ -764,6 +813,7 @@ server.tool(
   "notes_delete_where",
   "Delete all notes matching a word-based filter. SAFETY: without confirm=true, returns only the match count and deletes nothing — call again with confirm=true to delete.",
   { ...noteFilterShape, confirm: z.boolean().optional().describe("Set true to actually delete; otherwise returns the count only") },
+  DESTRUCTIVE,
   async ({ folder, search, tag, confirm }) => {
     const r = await Notes.deleteNotesWhere({ folder, search, tag }, confirm ?? false);
     if (!r.confirmed) {
@@ -781,6 +831,7 @@ server.tool(
     destination_folder: z.string().describe("Name of the folder to move matching notes into"),
     confirm: z.boolean().optional().describe("Set true to actually move; otherwise returns the count only"),
   },
+  MUTATE,
   async ({ folder, search, tag, destination_folder, confirm }) => {
     const r = await Notes.moveNotesWhere({ folder, search, tag }, destination_folder, confirm ?? false);
     if (!r.confirmed) {
